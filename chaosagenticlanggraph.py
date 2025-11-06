@@ -113,10 +113,16 @@ def parse_json_block(s: str):
     except Exception:
         return None
 
-# ------------------------------------------------------------
-# Auto-correct FIS template schema
-# ------------------------------------------------------------
+# ✅ Safe template correction logic
 def correct_fis_template(original: Dict[str, Any]) -> Dict[str, Any]:
+    instance_ids = []
+    actions = original.get("actions", [])
+    if isinstance(actions, list) and actions:
+        instance_ids = actions[0].get("parameters", {}).get("instanceIds", [])
+    elif isinstance(actions, dict):
+        first_action = next(iter(actions.values()), {})
+        instance_ids = first_action.get("parameters", {}).get("instanceIds", [])
+
     return {
         "description": original.get("description", "Chaos experiment for ECS resilience"),
         "roleArn": original.get("roleArn", "arn:aws:iam::123456789012:role/FISRole"),
@@ -124,7 +130,7 @@ def correct_fis_template(original: Dict[str, Any]) -> Dict[str, Any]:
             "terminateInstances": {
                 "actionId": "aws:ec2:terminate-instances",
                 "parameters": {
-                    "instanceIds": ",".join(original.get("actions", [{}])[0].get("parameters", {}).get("instanceIds", []))
+                    "instanceIds": ",".join(instance_ids) if instance_ids else "i-EXAMPLE123"
                 },
                 "targets": {
                     "InstancesTarget": "InstancesInAZ"
@@ -232,7 +238,7 @@ def render_dag(statuses):
     for src, dst in [("hypothesis", "plan"), ("plan", "template"), ("template", "validate"),
                      ("validate", "execute"), ("execute", "feedback")]:
         dag.edge(src, dst)
-    st.graphviz_chart(dag)
+    return dag
 
 # ------------------------------------------------------------
 # UI
@@ -247,25 +253,23 @@ if st.button("🚀 Run LangGraph Workflow"):
         st.warning("Please enter a goal.")
     else:
         statuses = {n: "pending" for n in ["hypothesis", "plan", "template", "validate", "execute", "feedback"]}
-        render_dag(statuses)
+        placeholder_dag = st.empty()
+        placeholder_results = st.container()
         initial = ChaosState(goal=goal.strip(), constraints=constraints.strip(), env=env.strip(), dry_run=dry_run)
 
         for stage in ["hypothesis", "plan", "template", "validate", "execute", "feedback"]:
             statuses[stage] = "in_progress"
-            render_dag(statuses)
-            st.info(f"Running stage: {stage}")
+            placeholder_dag.graphviz_chart(render_dag(statuses))
             result = workflow.invoke(initial, start_at=stage, end_at=stage)
 
             # Auto-correct template if validation fails
             if stage == "validate" and result.get("validation") and not result["validation"].get("ok"):
-                st.warning("Validation failed. Auto-correcting template...")
                 corrected = correct_fis_template(result.get("fis_template", {}))
                 result["fis_template"] = corrected
                 result["validation"] = {"ok": True, "reason": "Corrected schema applied"}
 
             # Retry execution if previous error
             if stage == "execute" and result.get("execution") and "error" in result["execution"]:
-                st.warning("Execution failed. Retrying with corrected template...")
                 corrected = correct_fis_template(result.get("fis_template", {}))
                 try:
                     resp = fis.create_experiment_template(**corrected)
@@ -280,20 +284,21 @@ if st.button("🚀 Run LangGraph Workflow"):
                 statuses[stage] = "failed"
             else:
                 statuses[stage] = "completed"
-            render_dag(statuses)
+            placeholder_dag.graphviz_chart(render_dag(statuses))
 
-            # Show relevant info
-            if stage == "hypothesis":
-                st.markdown(f"**Hypothesis:** {result.get('hypothesis', '—')}")
-            elif stage == "plan":
-                st.markdown(f"**Plan:**\n{result.get('plan', '—')}")
-            elif stage == "template":
-                st.code(result.get('fis_template_raw', 'Template generation failed'), language="json")
-            elif stage == "validate":
-                st.markdown(f"**Validation:** {result.get('validation', {})}")
-            elif stage == "execute":
-                st.markdown(f"**Execution:** {result.get('execution', {})}")
-            elif stage == "feedback":
-                st.markdown(f"**Feedback:** {result.get('feedback', '—')}")
+            # Show relevant info below DAG
+            with placeholder_results.expander(f"Stage: {stage.capitalize()}"):
+                if stage == "hypothesis":
+                    st.write(result.get('hypothesis', '—'))
+                elif stage == "plan":
+                    st.write(result.get('plan', '—'))
+                elif stage == "template":
+                    st.code(result.get('fis_template_raw', 'Template generation failed'), language="json")
+                elif stage == "validate":
+                    st.json(result.get('validation', {}))
+                elif stage == "execute":
+                    st.json(result.get('execution', {}))
+                elif stage == "feedback":
+                    st.write(result.get('feedback', '—'))
 
         st.success("✅ Workflow complete")
