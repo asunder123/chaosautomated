@@ -13,7 +13,7 @@ from langgraph.graph import StateGraph
 # Streamlit setup
 # ------------------------------------------------------------
 st.set_page_config(page_title="LangGraph Chaos Executor", layout="wide")
-st.title("🧠 LangGraph Chaos Executor (Claude + AWS FIS)")
+st.title("🧠 Autonomous LangGraph Chaos Executor (Claude + AWS FIS)")
 st.caption("AWS Bedrock → LangGraph → Auto FIS Template → Validation → Execution → Feedback")
 
 # ------------------------------------------------------------
@@ -227,28 +227,55 @@ graph.add_edge("execute", "feedback")
 workflow = graph.compile()
 
 # ------------------------------------------------------------
-# Dynamic DAG Renderer
+# Lively DAG Renderer
 # ------------------------------------------------------------
 def render_dag(statuses):
-    status_colors = {"completed": "green", "in_progress": "yellow", "failed": "red", "pending": "gray"}
+    status_colors = {
+        "completed": "#4CAF50",    # Green
+        "in_progress": "#FFC107",  # Amber
+        "failed": "#F44336",       # Red
+        "pending": "#B0BEC5"       # Gray
+    }
+
+    icons = {
+        "hypothesis": "🧠",
+        "plan": "📋",
+        "template": "🧱",
+        "validate": "✅",
+        "execute": "⚙️",
+        "feedback": "🔁"
+    }
+
     dag = graphviz.Digraph()
-    dag.attr(rankdir='LR', size='10')
+    dag.attr(rankdir='LR', size='10', bgcolor="#FAFAFA", fontname="Helvetica")
+    dag.attr(label="LangGraph Chaos Workflow\nStages Status", fontsize="20", labelloc="t", fontcolor="#333333")
+
     for node, status in statuses.items():
-        dag.node(node, label=node.capitalize(), style="filled", fillcolor=status_colors.get(status, "gray"))
+        dag.node(node,
+                 label=f"{icons[node]} {node.capitalize()}",
+                 shape="box",
+                 style="rounded,filled",
+                 fontname="Helvetica-Bold",
+                 fontsize="14",
+                 fillcolor=status_colors.get(status, "#B0BEC5"),
+                 color="#333333",
+                 penwidth="2")
+
     for src, dst in [("hypothesis", "plan"), ("plan", "template"), ("template", "validate"),
                      ("validate", "execute"), ("execute", "feedback")]:
-        dag.edge(src, dst)
+        dag.edge(src, dst, color="#616161", penwidth="2", arrowsize="1.2")
+
     return dag
 
 # ------------------------------------------------------------
 # UI
 # ------------------------------------------------------------
-st.subheader("⚙️ Chaos Workflow")
+st.subheader("⚙️ Autonomous Chaos Workflow")
 goal = st.text_area("Chaos Engineering Goal", placeholder="e.g. Test ECS resilience under AZ failure")
 constraints = st.text_area("Constraints / Guardrails", "(none)")
 env = st.text_input("Environment (optional)", "")
 
-if st.button("🚀 Run LangGraph Workflow"):
+if st.button("🚀 Run Autonomous Workflow"):
     if not goal.strip():
         st.warning("Please enter a goal.")
     else:
@@ -301,4 +328,5 @@ if st.button("🚀 Run LangGraph Workflow"):
                 elif stage == "feedback":
                     st.write(result.get('feedback', '—'))
 
-        st.success("✅ Workflow complete")
+        st.markdown("### Legend: ✅ Green = Completed | 🟡 Yellow = In Progress | 🔴 Red = Failed | ⚪ Gray = Pending")
+        st.success("✅ Autonomous Workflow Complete")
