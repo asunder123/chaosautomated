@@ -1,13 +1,8 @@
 """
-Agentic Bedrock Claude Haiku + LangGraph Terraform Orchestrator
----------------------------------------------------------------
-✅ Bedrock Claude (Haiku) generates and repairs Terraform HCL.
-✅ Full init → validate → plan → repair loop until plan succeeds.
-✅ Up to 50 repair attempts before failure (configurable).
-✅ Auto-feedback for failed apply → LLM correction.
-✅ Enforces correct AWS region & unique S3 bucket suffixes.
-✅ Recursion-safe: recursion_limit=100, max_iterations=100.
-✅ Optional safe auto-destroy after successful apply.
+Agentic Modular Terraform Orchestrator — Bedrock Claude 3 Haiku + LangGraph
+---------------------------------------------------------------------------
+Claude generates a full modularized Terraform project (main.tf + modules/*)
+Self-healing loop repairs errors until `plan` succeeds or 50 attempts.
 """
 
 import os, re, json, sys, subprocess, shutil, zipfile, stat, platform, time, datetime, random, string
@@ -108,42 +103,50 @@ ensure_python_packages(["langgraph"])
 from langgraph.graph import StateGraph, END
 
 class State(TypedDict, total=False):
-    region: str; model: str; prompt: str; workdir: str; hcl: str
-    steps: Dict[str,Any]; retries: int; max_retries: int; last_err: str
+    region: str; model: str; prompt: str; workdir: str; steps: Dict[str,Any]
+    retries: int; max_retries: int; last_err: str
 
-SYSTEM_CODEGEN = (
-    "You are a senior DevOps engineer. Generate a complete Terraform configuration (main.tf) "
-    "for AWS. Use provider hashicorp/aws >=5.0 with correct region and unique S3 bucket names. "
-    "Return valid HCL only, no markdown."
-)
+SYSTEM_CODEGEN = """
+You are an expert Terraform DevOps engineer.
+Generate a modularized Terraform project for AWS using the following structure:
+- main.tf at root
+- modules/<service_name>/main.tf (+ variables.tf if required)
+Use unique S3 bucket names and correct provider region.
+Return valid JSON where keys are file paths (e.g., "main.tf", "modules/s3/main.tf") and values are file contents.
+Only return valid JSON. No markdown or commentary.
+"""
 
-SYSTEM_CRITIC = (
-    "You are a Terraform repair agent. Given the main.tf and Terraform error logs, fix the configuration "
-    "to make it pass validation and plan. Return full corrected HCL only."
-)
+SYSTEM_CRITIC = """
+You are a Terraform repair agent. The project is modular.
+Given the current modular Terraform project (multiple files) and the Terraform error logs,
+return a corrected JSON mapping of only the files that need fixing.
+Only return valid JSON.
+"""
 
-CODE_FENCE_RE = re.compile(r"```(?:hcl|terraform)?\n([\s\S]*?)```", re.I)
+# -------------------------- Helper Functions --------------------------
 
-def random_suffix(n=6): return ''.join(random.choices(string.ascii_lowercase+string.digits,k=n))
+def write_modular_files(workdir: Path, file_map: Dict[str,str]):
+    for path, content in file_map.items():
+        full_path = workdir / path
+        full_path.parent.mkdir(parents=True, exist_ok=True)
+        full_path.write_text(content)
 
-def enforce_region_and_suffix(hcl:str, region:str)->str:
-    hcl = re.sub(r'region\s*=\s*".*?"', f'region = "{region}"', hcl)
-    def sfx(m): return f'bucket = "{m.group(1)}-{random_suffix()}"'
-    return re.sub(r'bucket\s*=\s*"([\w\.-]+)"', sfx, hcl)
+def extract_json(text: str) -> Optional[Dict[str,str]]:
+    try:
+        start = text.find("{")
+        end = text.rfind("}") + 1
+        return json.loads(text[start:end])
+    except Exception:
+        return None
 
 def node_codegen(s: State, claude: ClaudeBedrock)->State:
     start=time.time()
-    txt=claude.complete(SYSTEM_CODEGEN,f"Region: {s['region']}\nPrompt: {s['prompt']}\nReturn raw HCL only.")
+    txt=claude.complete(SYSTEM_CODEGEN,f"Region: {s['region']}\nPrompt: {s['prompt']}")
     end=time.time()
-    m=CODE_FENCE_RE.search(txt); hcl=(m.group(1) if m else txt).strip()
-    s["hcl"]=enforce_region_and_suffix(hcl,s["region"])
-    log_step(s,"codegen",0,hcl,"",start,end)
-    return s
-
-def node_write(s: State)->State:
-    w=Path(s["workdir"]); w.mkdir(exist_ok=True)
-    (w/"main.tf").write_text(s["hcl"])
-    log_step(s,"write",0,"main.tf written","",time.time(),time.time())
+    files = extract_json(txt)
+    if not files: raise RuntimeError("Claude did not return valid JSON project.")
+    write_modular_files(Path(s["workdir"]), files)
+    log_step(s,"codegen",0,json.dumps(list(files.keys()),indent=2),"",start,end)
     return s
 
 def node_tf(s: State,name:str,args:List[str],env:Dict[str,str])->State:
@@ -154,21 +157,23 @@ def node_tf(s: State,name:str,args:List[str],env:Dict[str,str])->State:
     return s
 
 def node_critic(s: State, claude: ClaudeBedrock, step:str)->State:
-    hcl=s.get("hcl","")
-    err=(s.get("steps",{}).get(step,{}).get("stderr") or "")+(s.get("steps",{}).get(step,{}).get("stdout") or "")
-    user=f"Current main.tf:\n{hcl}\n\nTerraform {step} errors:\n{err}\nReturn corrected full HCL."
+    workdir=Path(s["workdir"])
+    files={p.relative_to(workdir).as_posix():p.read_text() for p in workdir.rglob("*.tf")}
+    err=(s.get("steps",{}).get(step,{}).get("stderr") or "")
+    user=f"Terraform {step} error logs:\n{err}\n\nCurrent project files:\n{json.dumps(files)}"
     start=time.time()
     fix=claude.complete(SYSTEM_CRITIC,user)
     end=time.time()
-    m=CODE_FENCE_RE.search(fix); new=(m.group(1) if m else fix).strip()
-    s["hcl"]=enforce_region_and_suffix(new,s["region"])
-    log_step(s,f"critic_{step}",0,new,"",start,end)
+    updated=extract_json(fix)
+    if updated:
+        write_modular_files(workdir, updated)
+        log_step(s,f"critic_{step}",0,json.dumps(list(updated.keys())),fix,start,end)
     return s
 
 # -------------------------- Streamlit UI --------------------------
 
-st.set_page_config(page_title="Agentic Terraform Orchestrator (50 attempts)", layout="wide")
-st.title("🤖 Agentic Bedrock Claude Haiku + LangGraph Terraform (50 attempts)")
+st.set_page_config(page_title="Modular Agentic Terraform Orchestrator", layout="wide")
+st.title("🧠 Modular Agentic Bedrock Claude + LangGraph Terraform")
 
 with st.sidebar:
     region = st.text_input("AWS Region", os.environ.get("AWS_REGION","us-east-1"))
@@ -194,12 +199,12 @@ if validate or "aws_session" not in st.session_state:
     except Exception as e:
         st.error(str(e))
 
-prompt=st.text_area("Describe your infrastructure (natural language):",height=140)
-run_btn=st.button("Run Agentic Workflow")
+prompt=st.text_area("Describe your modular infrastructure:",height=140)
+run_btn=st.button("Run Modular Agentic Workflow")
 destroy_btn=st.button("Destroy")
 
 if "workdir" not in st.session_state:
-    st.session_state.workdir=Path.cwd()/ "tf_agentic_50"
+    st.session_state.workdir=Path.cwd()/ "tf_modular_agentic"
 workdir=st.session_state.workdir; workdir.mkdir(exist_ok=True)
 
 def build_env()->Dict[str,str]:
@@ -226,12 +231,10 @@ if run_btn:
     if "aws_session" not in st.session_state: st.warning("Validate AWS first."); st.stop()
     ensure_terraform(Path.home()/".tfbin")
 
-    from langgraph.graph import StateGraph, END
     graph=StateGraph(State)
     claude=ClaudeBedrock(st.session_state.aws_session,model=model,region=region)
 
     def _codegen(s): return node_codegen(s,claude)
-    def _write(s): return node_write(s)
     def _init(s): return node_tf(s,"init",["init"],build_env())
     def _validate(s): return node_tf(s,"validate",["validate"],build_env())
     def _plan(s): return node_tf(s,"plan",["plan","-out","plan.tfplan"],build_env())
@@ -240,24 +243,22 @@ if run_btn:
     def _critic_plan(s): return node_critic(s,claude,"plan")
     def _critic_apply(s): return node_critic(s,claude,"apply")
 
-    for n,f in {
-        "codegen":_codegen,"write":_write,"init":_init,"validate":_validate,
-        "plan":_plan,"critic_plan":_critic_plan,"apply":_apply,"critic_apply":_critic_apply,"output":_output
-    }.items(): graph.add_node(n,f)
+    for n,f in {"codegen":_codegen,"init":_init,"validate":_validate,"plan":_plan,
+                "critic_plan":_critic_plan,"apply":_apply,"critic_apply":_critic_apply,"output":_output}.items():
+        graph.add_node(n,f)
 
     graph.set_entry_point("codegen")
-    graph.add_edge("codegen","write"); graph.add_edge("write","init")
-    graph.add_edge("init","validate"); graph.add_edge("validate","plan")
+    graph.add_edge("codegen","init"); graph.add_edge("init","validate"); graph.add_edge("validate","plan")
 
     def after_plan(s:State):
         rc=s.get("steps",{}).get("plan",{}).get("rc",1)
         tries=s.get("retries",0)
-        if rc!=0 and tries<s.get("max_retries",50):
+        if rc!=0 and tries<s.get("max_retries",500):
             s["retries"]=tries+1
             return "critic_plan"
         return "apply" if rc==0 else END
     graph.add_conditional_edges("plan",after_plan,{"critic_plan":"critic_plan","apply":"apply",END:END})
-    graph.add_edge("critic_plan","write")
+    graph.add_edge("critic_plan","init")
 
     def after_apply(s:State):
         rc=s.get("steps",{}).get("apply",{}).get("rc",1)
@@ -267,19 +268,22 @@ if run_btn:
             return "critic_apply"
         return "output" if rc==0 else END
     graph.add_conditional_edges("apply",after_apply,{"critic_apply":"critic_apply","output":"output",END:END})
-    graph.add_edge("critic_apply","write")
+    graph.add_edge("critic_apply","init")
 
     app=graph.compile()
-    app.recursion_limit=1000  # Prevent overflow
+    app.recursion_limit=100
 
     state:State={"region":region,"model":model,"prompt":prompt,"workdir":str(workdir),
                  "steps":{},"retries":0,"max_retries":50,"last_err":""}
 
-    with st.spinner("Running agentic workflow (up to 50 repairs)..."):
+    with st.spinner("Running modular agentic Terraform workflow..."):
         final=app.invoke(state,max_iterations=100)
 
-    st.subheader("Generated Terraform (main.tf)")
-    st.code(final.get("hcl",""),language="hcl")
+    st.subheader("Generated Modular Terraform Files")
+    for p in Path(workdir).rglob("*.tf"):
+        st.markdown(f"**{p.relative_to(workdir)}**")
+        st.code(p.read_text(),language="hcl")
+
     st.subheader("Workflow Logs")
     render_steps(final)
 
@@ -295,9 +299,6 @@ if run_btn:
                 st.text_area("auto-destroy output",out+err,height=200)
     else:
         st.error("❌ Apply failed after 50 repairs.")
-
-    st.download_button("Download logs (JSON)",data=json.dumps(final.get("steps",{}),indent=2),
-                       file_name="tf_agentic_50_steps.json")
 
 # -------------------------- Manual Destroy --------------------------
 
