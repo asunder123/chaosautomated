@@ -1,216 +1,307 @@
-import streamlit as st
-import streamlit.components.v1 as components
-from streamlit_autorefresh import st_autorefresh
+"""
+AI-Driven Desktop Observability — Stable Version with Sparklines
+
+Run: streamlit run desktopautoobs.py
+"""
+
+import os
+import time
 import psutil
+import sqlite3
+import threading
+import tempfile
+import io
+import base64
+
+import streamlit as st
 import pandas as pd
+import numpy as np
 import networkx as nx
 from pyvis.network import Network
-import torch
-import torch.nn as nn
-import torch.optim as optim
-import sqlite3
-import os
-import datetime
+import streamlit.components.v1 as components
+import matplotlib.pyplot as plt
 
-# -----------------------------
-# Neural Network Model
-# -----------------------------
-MODEL_PATH = "failure_predictor.pt"
+# ------------------------ Paths & Model ------------------------
+MODEL_DIR = os.path.join(tempfile.gettempdir(), "obs_ai_models")
+os.makedirs(MODEL_DIR, exist_ok=True)
+CNN_MODEL_PATH = os.path.join(MODEL_DIR, "topology_cnn.keras")
 
-class FailurePredictor(nn.Module):
-    def __init__(self):
-        super(FailurePredictor, self).__init__()
-        self.fc = nn.Sequential(
-            nn.Linear(3, 16),
-            nn.ReLU(),
-            nn.Linear(16, 8),
-            nn.ReLU(),
-            nn.Linear(8, 1),
-            nn.Sigmoid()
-        )
+# ------------------------ TensorFlow (optional) ------------------------
+try:
+    import tensorflow as tf
+    from tensorflow.keras import layers, models
+    TF_AVAILABLE = True
+except Exception:
+    TF_AVAILABLE = False
 
-    def forward(self, x):
-        return self.fc(x)
+LATENT = 8
+INPUT_LEN = 64
 
-# Load or initialize model
-model = FailurePredictor()
-if os.path.exists(MODEL_PATH):
-    model.load_state_dict(torch.load(MODEL_PATH))
-optimizer = optim.Adam(model.parameters(), lr=0.01)
-loss_fn = nn.BCELoss()
+# ------------------------ DB ------------------------
+DB_PATH = os.path.join(tempfile.gettempdir(), "obs_metrics.db")
+DB = sqlite3.connect(DB_PATH, check_same_thread=False)
+LOCK = threading.Lock()
+DB.execute("CREATE TABLE IF NOT EXISTS metrics (ts INT, pid INT, name TEXT, cpu REAL, mem REAL)")
+DB.commit()
 
-# -----------------------------
-# SQLite Setup
-# -----------------------------
-DB_PATH = "process_intelligence.db"
-conn = sqlite3.connect(DB_PATH)
-cursor = conn.cursor()
-
-cursor.execute("""
-CREATE TABLE IF NOT EXISTS process_data (
-    pid INTEGER,
-    name TEXT,
-    cpu REAL,
-    ram REAL,
-    net REAL,
-    risk REAL,
-    system_group TEXT,
-    department TEXT,
-    location TEXT,
-    timestamp TEXT
-)
-""")
-conn.commit()
-
-# -----------------------------
-# LangGraph Orchestration
-# -----------------------------
-class LangGraph:
-    def __init__(self):
-        self.graph = nx.DiGraph()
-
-    def add_process_node(self, pid, name, cpu, ram, net, risk):
-        color = "red" if risk > 0.8 else "orange" if risk > 0.5 else "green"
-        tooltip = (
-            f"Process: {name}\n"
-            f"CPU: {cpu}% ({'High' if cpu > 80 else 'OK'})\n"
-            f"RAM: {ram:.1f}MB ({'High' if ram > 500 else 'OK'})\n"
-            f"Network: {net} connections\n"
-            f"Risk Score: {risk:.2f} ({'Critical' if risk > 0.8 else 'Warning' if risk > 0.5 else 'Healthy'})"
-        )
-        self.graph.add_node(pid, label=name, color=color, title=tooltip)
-
-    def add_packet_flow(self, src_pid, dst_ip):
-        self.graph.add_node(dst_ip, label=dst_ip, title="Network Node")
-        self.graph.add_edge(src_pid, dst_ip, arrow=True)
-
-    def build_topology(self, df, connections):
-        for _, row in df.iterrows():
-            features = torch.tensor([[row['cpu'], row['ram'], row['net']]], dtype=torch.float32)
-            risk = model(features).item()
-            self.add_process_node(row['pid'], row['name'], row['cpu'], row['ram'], row['net'], risk)
-        for conn in connections:
-            if conn.pid in df['pid'].values and conn.raddr:
-                self.add_packet_flow(conn.pid, conn.raddr.ip)
-
-    def render_html(self):
-        net = Network(height="500px", width="100%", bgcolor="#222222", font_color="white", directed=True)
-        for node, data in self.graph.nodes(data=True):
-            net.add_node(node, label=data.get('label', str(node)), title=data.get('title', 'Node'), color=data.get('color', 'blue'))
-        for src, dst in self.graph.edges():
-            net.add_edge(src, dst, arrows="to")
-        return net.generate_html()
-
-# -----------------------------
-# Data Collection
-# -----------------------------
-def get_process_data(limit=10):
-    processes = []
-    for proc in psutil.process_iter(['pid', 'name', 'cpu_percent', 'memory_info']):
-        if len(processes) >= limit:
-            break
+# ------------------------ CNN helpers ------------------------
+def load_or_create_cnn():
+    if TF_AVAILABLE and os.path.exists(CNN_MODEL_PATH):
         try:
-            info = proc.info
-            net_usage = sum(1 for conn in psutil.net_connections() if conn.pid == info['pid'])
-            processes.append({
-                'pid': info['pid'],
-                'name': info['name'],
-                'cpu': info['cpu_percent'],
-                'ram': info['memory_info'].rss / (1024 * 1024),  # MB
-                'net': net_usage,
-                'system_group': f"System-{info['pid'] % 3}",
-                'department': "Engineering",
-                'location': "Hyderabad"
-            })
-        except (psutil.NoSuchProcess, psutil.AccessDenied):
-            continue
-    return pd.DataFrame(processes)
+            return tf.keras.models.load_model(CNN_MODEL_PATH)
+        except Exception:
+            pass
+    if not TF_AVAILABLE:
+        return None
+    model = models.Sequential([
+        layers.Input(shape=(INPUT_LEN,1)),
+        layers.Conv1D(32,5,activation='relu'),
+        layers.MaxPool1D(2),
+        layers.Conv1D(64,5,activation='relu'),
+        layers.GlobalAveragePooling1D(),
+        layers.Dense(LATENT)
+    ])
+    model.compile(optimizer='adam', loss='mse')
+    try:
+        model.save(CNN_MODEL_PATH)
+    except Exception:
+        pass
+    return model
 
-def get_network_connections():
-    return psutil.net_connections(kind='inet')
+CNN = load_or_create_cnn()
 
-# -----------------------------
-# Dynamic Recommendations
-# -----------------------------
-def generate_recommendations(df):
-    recs = []
-    for _, row in df.iterrows():
-        if row['risk'] > 0.8:
-            recs.append(f"Terminate {row['name']} (PID {row['pid']}) - Critical risk.")
-        elif row['cpu'] > 80:
-            recs.append(f"Investigate {row['name']} - High CPU usage.")
-        elif row['ram'] > 500:
-            recs.append(f"Consider RAM upgrade for {row['name']}.")
-        elif row['net'] > 10:
-            recs.append(f"Audit network activity for {row['name']}.")
-    return recs if recs else ["No immediate actions required."]
+# ------------------------ DB functions ------------------------
+def insert_metrics(rows):
+    with LOCK:
+        DB.executemany("INSERT INTO metrics VALUES (?,?,?,?,?)", rows)
+        DB.commit()
 
-# -----------------------------
-# Streamlit UI
-# -----------------------------
-st_autorefresh(interval=5000, key="process_refresh")
+def query(window):
+    cutoff = int(time.time()) - window
+    try:
+        df = pd.read_sql_query(f"SELECT * FROM metrics WHERE ts >= {cutoff}", DB)
+    except Exception:
+        return pd.DataFrame()
+    if df.empty:
+        return df
+    df['ts'] = pd.to_datetime(df['ts'], unit='s')
+    return df
 
-st.title("📊 Hierarchical Process Intelligence Dashboard")
-st.caption(f"Last updated: {datetime.datetime.now().strftime('%H:%M:%S')}")
+# ------------------------ Collector ------------------------
+if 'collecting' not in st.session_state:
+    st.session_state.collecting = False
+if 'collector_thread' not in st.session_state:
+    st.session_state.collector_thread = None
 
-# Fetch data
-df = get_process_data(limit=10)
-connections = get_network_connections()
+def collect_once(top_n=12):
+    out = []
+    for p in psutil.process_iter(['pid','name','cpu_percent','memory_percent']):
+        try:
+            info = p.info
+            out.append((info['pid'], info.get('name') or str(info['pid']), float(info.get('cpu_percent') or 0), float(info.get('memory_percent') or 0)))
+        except Exception:
+            pass
+    out = sorted(out, key=lambda x: x[2], reverse=True)[:top_n]
+    ts = int(time.time())
+    rows = [(ts,pid,name,cpu,mem) for pid,name,cpu,mem in out]
+    insert_metrics(rows)
 
-# Train model incrementally
-if not df.empty:
-    X = torch.tensor(df[['cpu', 'ram', 'net']].values, dtype=torch.float32)
-    y = torch.tensor([[1 if cpu > 80 else 0] for cpu in df['cpu']], dtype=torch.float32)
-    optimizer.zero_grad()
-    preds = model(X)
-    loss = loss_fn(preds, y)
-    loss.backward()
-    optimizer.step()
-    torch.save(model.state_dict(), MODEL_PATH)
+def collector_loop(interval, top_n):
+    while st.session_state.collecting:
+        collect_once(top_n)
+        time.sleep(interval)
 
-# Predict risk and store in DB
-df['risk'] = [model(torch.tensor([[row['cpu'], row['ram'], row['net']]], dtype=torch.float32)).item() for _, row in df.iterrows()]
-timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-for _, row in df.iterrows():
-    cursor.execute("""
-    INSERT INTO process_data (pid, name, cpu, ram, net, risk, system_group, department, location, timestamp)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-    """, (row['pid'], row['name'], row['cpu'], row['ram'], row['net'], row['risk'], row['system_group'], row['department'], row['location'], timestamp))
-conn.commit()
+def start_collector(interval, top_n):
+    if st.session_state.collecting:
+        return
+    st.session_state.collecting = True
+    th = threading.Thread(target=collector_loop, args=(interval, top_n), daemon=True)
+    st.session_state.collector_thread = th
+    th.start()
 
-# Hierarchical summaries
-st.subheader("Hierarchical Intelligence")
-system_summary = pd.read_sql_query("SELECT system_group, AVG(risk) as avg_risk FROM process_data GROUP BY system_group", conn)
-dept_summary = pd.read_sql_query("SELECT department, AVG(risk) as avg_risk FROM process_data GROUP BY department", conn)
-loc_summary = pd.read_sql_query("SELECT location, AVG(risk) as avg_risk FROM process_data GROUP BY location", conn)
+def stop_collector():
+    st.session_state.collecting = False
 
-st.write("System-level Risk Summary")
-st.dataframe(system_summary)
-st.write("Department-level Risk Summary")
-st.dataframe(dept_summary)
-st.write("Location-level Risk Summary")
-st.dataframe(loc_summary)
+# ------------------------ Topology ------------------------
+def compute_golden_signals(cpu, mem):
+    load = max(cpu, mem)
+    if load < 40:
+        return 'green'
+    if load < 70:
+        return 'yellow'
+    return 'red'
 
-# Alerts
-if len(df[df['risk'] > 0.8]) > 0:
-    st.error("⚠ Critical Risk Detected!")
-    st.table(df[df['risk'] > 0.8][['pid', 'name', 'cpu', 'ram', 'risk']])
-else:
-    st.success("✅ No critical risks detected.")
+def build_graph(top_n=12):
+    procs = []
+    for p in psutil.process_iter(['pid','name','cpu_percent','memory_percent','ppid','io_counters']):
+        try:
+            info = p.info
+            io = info.get('io_counters')
+            r_bytes = getattr(io, 'read_bytes', 0) if io else 0
+            w_bytes = getattr(io, 'write_bytes', 0) if io else 0
+            info['r_bytes'] = r_bytes
+            info['w_bytes'] = w_bytes
+            procs.append(info)
+        except Exception:
+            pass
+    procs = sorted(procs, key=lambda x: float(x.get('cpu_percent') or 0), reverse=True)[:top_n]
 
-# Recommendations
-st.subheader("Dynamic Recommendations")
-for rec in generate_recommendations(df):
-    st.write(f"- {rec}")
+    G = nx.DiGraph()
+    for pr in procs:
+        cpu = float(pr.get('cpu_percent') or 0)
+        mem = float(pr.get('memory_percent') or 0)
+        health = compute_golden_signals(cpu, mem)
+        G.add_node(pr['pid'], label=pr.get('name') or str(pr['pid']), cpu=cpu, mem=mem, health=health, r_bytes=pr.get('r_bytes',0), w_bytes=pr.get('w_bytes',0))
 
-# Topology Viewer
-lg = LangGraph()
-lg.build_topology(df, connections)
-html_content = lg.render_html()
+    for pr in procs:
+        ppid = pr.get('ppid')
+        if ppid in G.nodes:
+            G.add_edge(ppid, pr['pid'], title='Parent→Child', color='blue', width=2)
 
-st.subheader("Topology Viewer (Color-coded Risk)")
-components.html(html_content, height=550, scrolling=True)
+    for a in procs:
+        for b in procs:
+            if a['pid'] == b['pid']:
+                continue
+            a_io = (a.get('r_bytes') or 0) + (a.get('w_bytes') or 0)
+            b_io = (b.get('r_bytes') or 0) + (b.get('w_bytes') or 0)
+            if a_io > 0 and a_io > b_io:
+                G.add_edge(a['pid'], b['pid'], title=f"Traffic IO {a_io}", color='orange', width=1)
+    return G
 
-# Risk Table
-st.subheader("Process Risk Details")
-st.dataframe(df[['pid', 'name', 'cpu', 'ram', 'net', 'risk']].sort_values('risk', ascending=False))
+# ------------------------ Embeddings ------------------------
+def compute_embeddings(G):
+    nodes = list(G.nodes())
+    if not nodes:
+        return {}
+    A = nx.to_numpy_array(G)
+    X = np.array([[G.nodes[n]['cpu'], G.nodes[n]['mem']] for n in nodes])
+    vectors = []
+    for i in range(len(nodes)):
+        flat = np.concatenate([A[i], X[i]])
+        v = np.zeros(INPUT_LEN)
+        v[:min(len(flat), INPUT_LEN)] = flat[:INPUT_LEN]
+        vectors.append(v)
+    vectors = np.array(vectors)
+    if CNN is not None:
+        try:
+            emb = CNN.predict(vectors.reshape((vectors.shape[0], vectors.shape[1], 1)), verbose=0)
+            CNN.save(CNN_MODEL_PATH)
+        except Exception:
+            emb = np.random.randn(len(nodes), LATENT)
+    else:
+        emb = np.random.randn(len(nodes), LATENT)
+    return {node: emb[i] for i, node in enumerate(nodes)}
+
+# ------------------------ Sparklines ------------------------
+def make_sparkline(pid, window=120, width=180, height=40):
+    cutoff = int(time.time()) - window
+    try:
+        with LOCK:
+            df_pid = pd.read_sql_query(f"SELECT ts,cpu FROM metrics WHERE ts >= {cutoff} AND pid = {int(pid)} ORDER BY ts ASC", DB)
+    except Exception:
+        return None
+    buf = io.BytesIO()
+    plt.figure(figsize=(width/100, height/100))
+    if df_pid.empty:
+        plt.plot([], [])
+    else:
+        df_pid['ts'] = pd.to_datetime(df_pid['ts'], unit='s')
+        plt.plot(df_pid['ts'], df_pid['cpu'], linewidth=1)
+        plt.fill_between(df_pid['ts'], df_pid['cpu'], alpha=0.15)
+    plt.xticks([])
+    plt.yticks([])
+    plt.tight_layout()
+    plt.savefig(buf, format='png', bbox_inches='tight', pad_inches=0)
+    plt.close()
+    return base64.b64encode(buf.getvalue()).decode('ascii')
+
+# ------------------------ Rendering ------------------------
+def render_topology(G, emb):
+    net = Network(height='650px', width='100%', directed=True)
+    net.barnes_hut(gravity=-40000, spring_length=200, central_gravity=0.2, damping=0.09)
+
+    for node, data in G.nodes(data=True):
+        color = {'green':'#27AE60','yellow':'#F4D03F','red':'#C0392B'}.get(data.get('health','green'), '#27AE60')
+        title = f"<b>{data.get('label')}</b><br>CPU: {data.get('cpu',0):.1f}%<br>MEM: {data.get('mem',0):.1f}%<br>Health: {data.get('health','unknown')}"
+
+        try:
+            b64 = make_sparkline(node)
+            if b64:
+                img_html = (
+                    f'<div style="width:180px">'
+                    f'<b>{data.get("label")}</b><br>'
+                    f'<img src="data:image/png;base64,{b64}" style="width:180px;height           )
+                title = (
+                    img_html +
+                    f'<div style="font-size:12px;">CPU: {data.get("cpu",0):.1f}% &nbsp; MEM: {data.get("mem",0):.1f}%'
+                    f'<br>Health: {data.get("health","unknown")}'
+                    f'<br>Read: {data.get("r_bytes",0):,} bytes<br>Write: {data.get("w_bytes",0):,} bytes</div>'
+                )
+        except Exception:
+            pass
+
+        net.add_node(node, label=str(data.get('label'))[:18], title=title, color=color, size=25)
+
+    for u, v, d in G.edges(data=True):
+        traffic = d.get('title','')
+        try:
+            vol = int(''.join(ch for ch in traffic if ch.isdigit()))
+            width = max(1, min(15, vol // 50000))
+        except:
+            width = d.get('width', 1)
+        net.add_edge(u, v, color=d.get('color', 'gray'), title=d.get('title', ''), width=width, arrows='to')
+
+    path = os.path.join(tempfile.gettempdir(), f"golden_topology_{int(time.time())}.html")
+    net.save_graph(path)
+    with open(path, 'r', encoding='utf-8') as f:
+        return f.read()
+
+# ------------------------ Recommendations ------------------------
+def summarize(df):
+    if df.empty:
+        return 'No data yet'
+    agg = df.groupby('pid').agg({'cpu':'mean','mem':'mean','name':'first'}).reset_index()
+    top = agg.sort_values('cpu', ascending=False).head(5)
+    out = ['Recommendations:']
+    for _, r in top.iterrows():
+        out.append(f"{r['name']} → CPU {r['cpu']:.1f}% MEM {r['mem']:.1f}%")
+    return '\n'.join(out)
+
+# ------------------------ Streamlit UI ------------------------
+st.set_page_config(layout='wide')
+st.title('AppDynamics-Style Desktop Observability (Stable)')
+with st.sidebar:
+    st.header('Collector')
+    interval = st.number_input('Interval', 1, 10, 2)
+    top_n = st.number_input('Top N', 3, 50, 12)
+    if st.button('Start'):
+        start_collector(interval, top_n)
+        st.success('Collector started')
+    if st.button('Stop'):
+        stop_collector()
+        st.warning('Collector stopped')
+    auto = st.checkbox('Auto-refresh', value=True)
+    refresh = st.number_input('Refresh every (sec)', 1, 10, 3)
+
+left, right = st.columns((1.4, 1))
+with left:
+    st.subheader('Topology')
+    G = build_graph(top_n)
+    emb = compute_embeddings(G)
+    html = render_topology(G, emb)
+    components.html(html, height=650)
+with right:
+    st.subheader('Metrics (last 5 min)')
+    df = query(300)
+    if not df.empty:
+        agg = df.groupby('ts').cpu.sum().reset_index()
+        st.line_chart(agg.set_index('ts'))
+        st.dataframe(df.tail(200))
+    else:
+        st.info('No metrics yet')
+    st.subheader('Recommendations')
+    st.code(summarize(df))
+
+if auto:
+    time.sleep(refresh)
+    st.experimental_rerun()
