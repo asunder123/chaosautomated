@@ -93,6 +93,5 @@ FAHT bridges the gap between **research-grade hierarchical models** and **produc
 
 ***
 
-👉 Do you want me to **add a “Comparison with Existing Models” section in this README** (with a table vs HLogformer and HitAnomaly) or **include a diagram of the architecture in the README**?
 
 @AnandSunder
