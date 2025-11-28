@@ -1,3 +1,4 @@
+
 import streamlit as st
 import torch
 import torch.nn as nn
@@ -10,7 +11,7 @@ import matplotlib.pyplot as plt
 # ======================================================
 # 1. Streamlit Config
 # ======================================================
-st.set_page_config(page_title="Semantic Activity Log Analyzer v15", layout="wide")
+st.set_page_config(page_title="Semantic Activity Log Analyzer v16", layout="wide")
 
 # ======================================================
 # 2. Positional Encoding
@@ -39,14 +40,24 @@ class PositionalEncoding(nn.Module):
         return x + pe
 
 # ======================================================
-# 3. Fully Adaptive Hierarchical Transformer
+# 3. Context-Aware Router
+# ======================================================
+class ContextAwareRouter(nn.Module):
+    def __init__(self, embed_dim, threshold=0.2):
+        super().__init__()
+        self.scorer = nn.Linear(embed_dim, 1)
+        self.threshold = threshold
+
+    def forward(self, embeddings):
+        scores = torch.sigmoid(self.scorer(embeddings))  # Importance score per token
+        mask = scores.squeeze(-1) > self.threshold
+        routed = embeddings[mask] if mask.any() else embeddings  # fallback if all pruned
+        return routed, mask
+
+# ======================================================
+# 4. Fully Adaptive Hierarchical Transformer v16
 # ======================================================
 class AdaptiveHierarchicalTransformer(nn.Module):
-    """
-    Fully adaptive hierarchical transformer for logs.
-    - Adaptive summary tokens per chunk
-    - Handles variable line lengths and number of lines
-    """
     def __init__(self, vocab_size=256, embed_dim=512, n_heads=16, line_layers=4, chunk_layers=2, max_summary_tokens=4, num_classes=8):
         super().__init__()
         self.embed_dim = embed_dim
@@ -67,26 +78,20 @@ class AdaptiveHierarchicalTransformer(nn.Module):
         self.max_summary_tokens = max_summary_tokens
         self.num_classes = num_classes
         self.fc_line = nn.Linear(embed_dim, num_classes)
+        self.router = ContextAwareRouter(embed_dim)
 
-    # ----------------------
-    # Line-level forward
-    # ----------------------
     def forward_line(self, x):
         emb = self.embed(x)
         emb = self.line_pos(emb)
         out = self.line_transformer(emb)
-        pooled = out.mean(dim=1)  # mean pooling over line sequence
+        pooled = out.mean(dim=1)
         logits = torch.sigmoid(self.fc_line(pooled))
         return logits, pooled
 
-    # ----------------------
-    # Chunk-level adaptive forward
-    # ----------------------
     def forward_chunk_adaptive(self, line_embeddings_list):
         if len(line_embeddings_list) == 0:
             return torch.zeros(1, self.embed_dim)
 
-        # Flatten embeddings safely
         clean_list = []
         for emb in line_embeddings_list:
             if isinstance(emb, list):
@@ -94,26 +99,27 @@ class AdaptiveHierarchicalTransformer(nn.Module):
             emb = emb.view(-1) if emb.ndim > 1 else emb
             clean_list.append(emb)
 
-        lines_tensor = torch.stack(clean_list, dim=0)  # [num_lines, embed_dim]
+        lines_tensor = torch.stack(clean_list, dim=0)
 
-        # Adaptive summary tokens
         num_summary_tokens = min(self.max_summary_tokens, lines_tensor.size(0))
         summary_tokens = torch.zeros(num_summary_tokens, self.embed_dim, device=lines_tensor.device)
 
-        # Soft clustering init
         cluster_assign = torch.softmax(torch.rand(num_summary_tokens, lines_tensor.size(0)), dim=-1)
-        summary_tokens = cluster_assign @ lines_tensor  # [summary_tokens, embed_dim]
+        summary_tokens = cluster_assign @ lines_tensor
 
-        # Combine summary + lines
-        seq = torch.cat([summary_tokens, lines_tensor], dim=0).unsqueeze(0)  # [1, num_summary + num_lines, embed_dim]
-        seq = self.chunk_pos(seq)
+        seq = torch.cat([summary_tokens, lines_tensor], dim=0)
 
-        out = self.chunk_transformer(seq)
-        pooled = self.norm_chunk(out[:, :num_summary_tokens, :].mean(dim=1))
+        # Apply Context-Aware Routing
+        routed_tokens, mask = self.router(seq)
+        routed_tokens = routed_tokens.unsqueeze(0)
+        routed_tokens = self.chunk_pos(routed_tokens)
+
+        out = self.chunk_transformer(routed_tokens)
+        pooled = self.norm_chunk(out.mean(dim=1))
         return pooled
 
 # ======================================================
-# 4. Load Model
+# 5. Load Model
 # ======================================================
 @st.cache_resource
 def load_model():
@@ -124,7 +130,7 @@ def load_model():
 model = load_model()
 
 # ======================================================
-# 5. Helper Functions
+# 6. Helper Functions
 # ======================================================
 ACTIVITY_LABELS = ["STARTUP","SHUTDOWN","CONNECTION_ERROR","AUTH_FAILURE","RETRY","TIMEOUT","CRASH_LOOP","DATA_PROCESSING"]
 
@@ -166,10 +172,10 @@ def generate_human_summary(chunk_embeddings, cluster_labels, activities_per_chun
     return "\n".join(summary)
 
 # ======================================================
-# 6. Streamlit UI
+# 7. Streamlit UI
 # ======================================================
-st.title("🧠 Semantic Activity Log Analyzer v15")
-st.caption("Fully adaptive transformer for any log size and pattern")
+st.title("🧠 Semantic Activity Log Analyzer v16")
+st.caption("Fully adaptive transformer with context-aware routing for any log size and pattern")
 
 uploaded_file = st.file_uploader("Upload log file:", type=["txt","log","csv","json"])
 if uploaded_file:
@@ -184,7 +190,7 @@ if uploaded_file:
         "Count":[len(errors),len(warns),len(infos)]
     }))
 
-    lines = raw_text.splitlines()[:500]  # limit for demo
+    lines = raw_text.splitlines()[:500]
     line_embeddings, activities_per_line, anom_list = [], [], []
 
     for line in lines:
@@ -202,7 +208,6 @@ if uploaded_file:
     })
     st.dataframe(df,use_container_width=True)
 
-    # Process chunks adaptively
     chunk_size = 50
     chunk_embeddings, activities_per_chunk = [], []
 
@@ -219,7 +224,6 @@ if uploaded_file:
     human_summary = generate_human_summary(chunk_embeddings, cluster_labels, activities_per_chunk)
     st.text(human_summary)
 
-    # Visualization: Anomaly heatmap
     st.subheader("🔥 Anomaly Heatmap")
     fig, ax = plt.subplots(figsize=(12,4))
     ax.plot(anom_list, marker='o', linestyle='-', color='red')
@@ -228,9 +232,8 @@ if uploaded_file:
     ax.set_title("Line-wise Anomaly Trend")
     st.pyplot(fig)
 
-    # Download report
     report = f"""
-=== SEMANTIC INCIDENT REPORT v15 ===
+=== SEMANTIC INCIDENT REPORT v16 ===
 
 File: {uploaded_file.name}
 
@@ -246,4 +249,4 @@ Average Anomaly: {anomaly_mean:.3f}
 --- RAW LOG SAMPLE ---
 {raw_text[:2000]}
 """
-    st.download_button("📥 Download Semantic Incident Report", report, "semantic_incident_report_v15.txt","text/plain")
+    st.download_button("📥 Download Semantic Incident Report", report, "semantic_incident_report_v16.txt","text/plain")
