@@ -13,8 +13,27 @@ try:
     import PyPDF2
     HAS_PYPDF = True
 except ImportError:
+    HAS_PDF = False
     HAS_PYPDF = False
 
+# ---------------- UI THEME ----------------
+st.set_page_config(page_title="Hierarchical Doc QA", layout="wide")
+st.markdown("""
+<style>
+html, body, .stApp { background-color:#202123 !important; color:#ECECEC !important; }
+.main-container { max-width: 1100px; margin:auto; padding:8px; }
+section[data-testid="stSidebar"] { background-color:#202123 !important; border-right:1px solid #2f3136 !important; }
+section[data-testid="stSidebar"] * { color:#ECECEC !important; }
+textarea, input[type="text"] { background-color:#343541 !important; color:#ECECEC !important; border-radius:8px; border:1px solid #565869; }
+textarea::placeholder, input[type="text"]::placeholder { color:#9FA0A5 !important; }
+[data-testid="stFileUploader"] { background-color:#343541 !important; border-radius:8px; border:1px dashed #565869 !important; }
+[data-testid="stFileUploader"] * { color:#ECECEC !important; }
+.stButton > button { background-color:#10A37F !important; color:white !important; border-radius:6px; border:none; }
+.debug-box { background:#1f1f1f;border-radius:8px;border:1px solid #333;padding:8px;font-size:13px;color:#ddd; }
+</style>
+""", unsafe_allow_html=True)
+
+# ---------------- GLOBAL CONSTANTS ----------------
 PAD, UNK, CLS, SEP = 0, 1, 2, 3
 
 STOPWORDS = set("""
@@ -45,7 +64,7 @@ ROLE_WORDS = {
     "team","department","committee","group","organization","stakeholder","supervisor"
 }
 
-# ---------------- basic text utils ----------------
+# ---------------- BASIC TEXT UTILS ----------------
 def simple_tokenize(text: str) -> List[str]:
     text = re.sub(r"[^a-zA-Z0-9]+", " ", text.lower())
     return text.split()
@@ -79,22 +98,18 @@ def heuristic_sentence_score(sentences: List[str]) -> List[float]:
     for s in sentences:
         toks = simple_tokenize(s)
         if not toks:
-            scores.append(0.0)
-            continue
+            scores.append(0.0); continue
         length = len(toks)
         if length < 5 or length > 60:
             length_score = 0.2
         else:
             length_score = min(1.0, length / 30.0)
-        rare_sum = 0.0
-        rare_count = 0
+        rare_sum = 0.0; rare_count = 0
         for w in toks:
-            if w in STOPWORDS:
-                continue
+            if w in STOPWORDS: continue
             f = freq.get(w, 1)
             rarity = 1.0 - (f / max_freq)
-            rare_sum += rarity
-            rare_count += 1
+            rare_sum += rarity; rare_count += 1
         rare_score = (rare_sum / rare_count) if rare_count > 0 else 0.0
         has_digit = any(any(c.isdigit() for c in w) for w in toks)
         numeric_score = 0.2 if has_digit else 0.0
@@ -105,7 +120,7 @@ def heuristic_sentence_score(sentences: List[str]) -> List[float]:
         scores.append(base)
     return scores
 
-# ---------------- question type & semantics ----------------
+# ---------------- QUESTION TYPE & SEMANTIC TAGGING ----------------
 def detect_question_type(q: str) -> str:
     q = q.lower().strip()
     if q.startswith("who") or q.startswith("whom"):
@@ -121,31 +136,31 @@ def detect_question_type(q: str) -> str:
     return "general"
 
 def tag_sentence_semantics(s: str) -> List[str]:
-    """
-    Tag a sentence as what/how/why/who (can be multiple).
-    """
     tags = []
     lower = s.lower()
 
-    # WHY: causal
-    if any(cue in lower for cue in ["because", "due to", "so that", "therefore", "hence", "as a result", "resulted in", "led to"]):
+    # WHY
+    if any(cue in lower for cue in [
+        "because", "due to", "so that", "therefore", "hence",
+        "as a result", "resulted in", "led to"
+    ]):
         tags.append("why")
 
-    # HOW: process
+    # HOW
     if any(cue in lower for cue in [
         "first", "second", "third", "then", "next", "after that",
         "step", "process", "procedure", "by doing", "by using"
     ]):
         tags.append("how")
 
-    # WHAT: definitional / descriptive
+    # WHAT (definition/description)
     if any(phrase in lower for phrase in [
         "is defined as", "refers to", "is described as",
         "this document describes", "this section covers", "the purpose of"
     ]) or " is " in lower[:80]:
         tags.append("what")
 
-    # WHO: people / roles
+    # WHO (names/roles)
     toks = s.split()
     caps = [t for t in toks[1:] if t and t[0].isupper() and t.lower() not in STOPWORDS]
     roles = [t for t in toks if t.lower() in ROLE_WORDS]
@@ -156,19 +171,36 @@ def tag_sentence_semantics(s: str) -> List[str]:
         tags.append("what")
     return tags
 
-def extract_people_or_roles(sentences: List[str]) -> List[str]:
-    results = []
-    for s in sentences:
+def build_pattern_bank(sentences: List[str], tags_per_sent: List[List[str]]) -> Dict[str, List[int]]:
+    """Light pattern memory: indices per pattern type."""
+    bank = {
+        "causal": [],
+        "process": [],
+        "definition": [],
+        "entity": []
+    }
+    for i, s in enumerate(sentences):
+        lower = s.lower()
+        tags = tags_per_sent[i]
+
+        if "why" in tags or any(c in lower for c in ["because", "due to", "as a result", "led to"]):
+            bank["causal"].append(i)
+
+        if "how" in tags or any(c in lower for c in ["step", "process", "procedure", "first", "then", "next"]):
+            bank["process"].append(i)
+
+        if "what" in tags or any(c in lower for c in ["is defined as", "refers to", "is described as"]):
+            bank["definition"].append(i)
+
         toks = s.split()
-        if not toks:
-            continue
         caps = [t for t in toks[1:] if t and t[0].isupper() and t.lower() not in STOPWORDS]
         roles = [t for t in toks if t.lower() in ROLE_WORDS]
         if caps or roles:
-            results.append(s)
-    return results
+            bank["entity"].append(i)
 
-# ---------------- models ----------------
+    return bank
+
+# ---------------- MODELS ----------------
 class PositionalEncoding(nn.Module):
     def __init__(self, d_model: int, max_len: int = 256):
         super().__init__()
@@ -211,12 +243,12 @@ def encode_sentence_tokens(text: str, vocab: Dict[str, int], max_len: int) -> to
 
 def train_sentence_embedder(
     model: SentenceEmbedder,
-    sentences: List[str],
-    scores: List[float],
-    vocab: Dict[str, int],
-    max_len: int,
-    device: torch.device,
-    epochs: int = 2,
+    sentences,
+    scores,
+    vocab,
+    max_len,
+    device,
+    epochs=2,
 ):
     if not sentences:
         return
@@ -235,11 +267,7 @@ def train_sentence_embedder(
         opt.step()
 
 def get_sentence_embeddings(
-    model: SentenceEmbedder,
-    sentences: List[str],
-    vocab: Dict[str, int],
-    max_len: int,
-    device: torch.device,
+    model, sentences, vocab, max_len, device
 ) -> torch.Tensor:
     if not sentences:
         return torch.empty(0, model.d_model)
@@ -255,12 +283,8 @@ def get_sentence_embeddings(
     return torch.stack(embs, dim=0)
 
 def get_model_scores(
-    model: SentenceEmbedder,
-    sentences: List[str],
-    vocab: Dict[str, int],
-    max_len: int,
-    device: torch.device,
-) -> List[float]:
+    model, sentences, vocab, max_len, device
+):
     model.eval()
     out = []
     with torch.no_grad():
@@ -273,11 +297,8 @@ def get_model_scores(
     return out
 
 def cluster_and_deduplicate(
-    sentences: List[str],
-    scores: List[float],
-    embeddings: torch.Tensor,
-    sim_thresh: float = 0.75,
-) -> List[int]:
+    sentences, scores, embeddings, sim_thresh=0.75
+):
     n = len(sentences)
     if n == 0:
         return []
@@ -286,15 +307,13 @@ def cluster_and_deduplicate(
     for i in range(n):
         if used[i]:
             continue
-        cluster = [i]
-        used[i] = True
+        cluster = [i]; used[i] = True
         for j in range(i + 1, n):
             if used[j]:
                 continue
             sim = torch.nn.functional.cosine_similarity(embeddings[i], embeddings[j], dim=0).item()
             if sim > sim_thresh:
-                cluster.append(j)
-                used[j] = True
+                cluster.append(j); used[j] = True
         best_idx = max(cluster, key=lambda idx: scores[idx])
         selected.append(best_idx)
     return sorted(selected)
@@ -327,7 +346,7 @@ def encode_pair(q: str, s: str, vocab: Dict[str, int], max_len: int) -> torch.Te
         ids += [PAD] * (max_len - len(ids))
     return torch.tensor(ids, dtype=torch.long)
 
-def build_cross_pairs(sentences: List[str], vocab: Dict[str,int], max_len:int):
+def build_cross_pairs(sentences, vocab, max_len):
     if len(sentences) < 2:
         return None, None
     X, y = [], []
@@ -341,12 +360,7 @@ def build_cross_pairs(sentences: List[str], vocab: Dict[str,int], max_len:int):
     return torch.stack(X), torch.tensor(y, dtype=torch.float32)
 
 def train_cross_encoder(
-    model: CrossEncoder,
-    sentences: List[str],
-    vocab: Dict[str,int],
-    max_len:int,
-    device: torch.device,
-    epochs:int = 2,
+    model, sentences, vocab, max_len, device, epochs=2
 ):
     X, y = build_cross_pairs(sentences, vocab, max_len)
     if X is None:
@@ -365,13 +379,8 @@ def train_cross_encoder(
         opt.step()
 
 def score_query_against_sentences(
-    query: str,
-    sentences: List[str],
-    model: CrossEncoder,
-    vocab: Dict[str,int],
-    max_len:int,
-    device: torch.device,
-) -> List[float]:
+    query, sentences, model, vocab, max_len, device
+):
     model.eval()
     scores = []
     with torch.no_grad():
@@ -403,7 +412,7 @@ class TinyFactLM(nn.Module):
         h = self.enc(h, mask)
         return self.lm_head(h)
 
-def build_lm_vocab(sentences: List[str], extra_tokens: List[str], max_vocab: int = 15000) -> Dict[str,int]:
+def build_lm_vocab(sentences, extra_tokens, max_vocab=15000):
     freq: Dict[str, int] = {}
     for s in sentences:
         for t in simple_tokenize(s):
@@ -422,7 +431,7 @@ def build_lm_vocab(sentences: List[str], extra_tokens: List[str], max_vocab: int
         idx += 1
     return vocab
 
-def encode_lm(text: str, vocab: Dict[str,int], max_len: int) -> torch.Tensor:
+def encode_lm(text, vocab, max_len):
     toks = ["<bos>"] + simple_tokenize(text) + ["<eos>"]
     ids = [vocab.get(t, UNK) for t in toks[:max_len]]
     if len(ids) < max_len:
@@ -430,12 +439,7 @@ def encode_lm(text: str, vocab: Dict[str,int], max_len: int) -> torch.Tensor:
     return torch.tensor(ids, dtype=torch.long)
 
 def train_tiny_fact_lm(
-    model: TinyFactLM,
-    sentences: List[str],
-    vocab: Dict[str,int],
-    max_len: int,
-    device: torch.device,
-    epochs: int = 2,
+    model, sentences, vocab, max_len, device, epochs=2
 ):
     model.to(device)
     model.train()
@@ -457,14 +461,14 @@ def train_tiny_fact_lm(
             loss.backward()
             opt.step()
 
-def weight_glue_words(vocab: Dict[str,int], weight: float = 1.8):
+def weight_glue_words(vocab):
     weighted_ids = set()
     for w in GLUE_WORDS:
         if w in vocab:
             weighted_ids.add(vocab[w])
     return weighted_ids
 
-def extract_contextual_synonyms(sentences: List[str]) -> set:
+def extract_contextual_synonyms(sentences):
     freq = {}
     for s in sentences:
         for t in simple_tokenize(s):
@@ -473,7 +477,7 @@ def extract_contextual_synonyms(sentences: List[str]) -> set:
     sorted_ctx = sorted(freq.items(), key=lambda x: -x[1])[:30]
     return set(t for t, _ in sorted_ctx)
 
-def generate_topic_continuity_tokens(sentences: List[str]) -> set:
+def generate_topic_continuity_tokens(sentences):
     continuity = set()
     for s in sentences:
         toks = simple_tokenize(s)
@@ -484,9 +488,7 @@ def generate_topic_continuity_tokens(sentences: List[str]) -> set:
     return continuity
 
 def build_allowed_ids_for_fact(
-    fact_text: str,
-    vocab: Dict[str,int],
-    compressed_sents: List[str],
+    fact_text, vocab, compressed_sents
 ):
     fact_tokens = set(simple_tokenize(fact_text))
     ctx_syn = extract_contextual_synonyms(compressed_sents)
@@ -496,7 +498,7 @@ def build_allowed_ids_for_fact(
     for tok in allowed_tokens:
         if tok in vocab:
             allowed.add(vocab[tok])
-    weighted_glue_ids = weight_glue_words(vocab, weight=1.8)
+    weighted_glue_ids = weight_glue_words(vocab)
     allowed.update([
         vocab.get("<bos>", -1),
         vocab.get("<eos>", -1),
@@ -515,17 +517,17 @@ def top_k_filter(logits: torch.Tensor, k: int) -> torch.Tensor:
     return torch.where(logits < min_values, torch.full_like(logits, float("-inf")), logits)
 
 def generate_fact_locked(
-    model: TinyFactLM,
-    prompt: str,
-    fact_text: str,
-    compressed_sents: List[str],
-    vocab: Dict[str,int],
-    max_len: int,
-    device: torch.device,
-    max_new_tokens: int = 120,
-    temperature: float = 0.9,
-    top_k: int = 20,
-) -> str:
+    model,
+    prompt,
+    fact_text,
+    compressed_sents,
+    vocab,
+    max_len,
+    device,
+    max_new_tokens=120,
+    temperature=0.9,
+    top_k=20,
+):
     model.eval()
     inv_vocab = {idx: tok for tok, idx in vocab.items()}
     x = encode_lm(prompt, vocab, max_len).to(device)
@@ -599,8 +601,7 @@ def generate_fact_locked(
     for idx in ids:
         tok = inv_vocab.get(idx, "")
         if tok == "<bos>":
-            started = True
-            continue
+            started = True; continue
         if tok == "<eos>":
             break
         if not started:
@@ -608,66 +609,85 @@ def generate_fact_locked(
         tokens.append(tok)
     return " ".join(tokens)
 
-def choose_dynamic_top_k(
-    query: str,
-    sentences: List[str],
-    scores: List[float],
-    max_k: int,
-    semantic_buckets: Dict[str, List[int]],
-) -> List[Tuple[int, str]]:
-    if not sentences:
-        return []
-
+# ---------------- LANGGRAPH-LIKE ORCHESTRATION NODES ----------------
+def node_classify_query(query: str) -> Dict[str, str]:
     qtype = detect_question_type(query)
+    return {"qtype": qtype}
 
-    # 1) choose candidate indices from buckets
+def node_plan_retrieval(qmeta: Dict[str, str], semantic_buckets: Dict[str, List[int]], pattern_bank: Dict[str, List[int]]) -> Dict:
+    qtype = qmeta["qtype"]
+    plan = {"candidate_idxs": [], "k": 3}
+
     if qtype == "who":
-        candidate_idxs = semantic_buckets.get("who", [])
-        if not candidate_idxs:
-            candidate_idxs = semantic_buckets.get("what", list(range(len(sentences))))
+        idxs = semantic_buckets.get("who", [])
+        if not idxs:
+            idxs = pattern_bank.get("entity", [])
+        plan["candidate_idxs"] = idxs or list(range(0, 0))
+        plan["k"] = 2
+
     elif qtype == "why":
-        candidate_idxs = semantic_buckets.get("why", [])
-        if not candidate_idxs:
-            candidate_idxs = semantic_buckets.get("what", list(range(len(sentences))))
+        idxs = semantic_buckets.get("why", []) or pattern_bank.get("causal", [])
+        if not idxs:
+            idxs = semantic_buckets.get("what", [])
+        plan["candidate_idxs"] = idxs or list(range(0, 0))
+        plan["k"] = 3
+
     elif qtype == "how":
-        candidate_idxs = semantic_buckets.get("how", [])
-        if not candidate_idxs:
-            candidate_idxs = semantic_buckets.get("what", list(range(len(sentences))))
+        idxs = semantic_buckets.get("how", []) or pattern_bank.get("process", [])
+        if not idxs:
+            idxs = semantic_buckets.get("what", [])
+        plan["candidate_idxs"] = idxs or list(range(0, 0))
+        plan["k"] = 3
+
     elif qtype == "what_happened":
-        candidate_idxs = list(set(
+        idxs = list(set(
             semantic_buckets.get("how", []) +
             semantic_buckets.get("why", []) +
             semantic_buckets.get("what", [])
         ))
-        if not candidate_idxs:
-            candidate_idxs = list(range(len(sentences)))
-    elif qtype == "what":
-        candidate_idxs = semantic_buckets.get("what", [])
-        if not candidate_idxs:
-            candidate_idxs = list(range(len(sentences)))
-    else:
-        candidate_idxs = list(range(len(sentences)))
+        plan["candidate_idxs"] = idxs or list(range(0, 0))
+        plan["k"] = 2
 
+    elif qtype == "what":
+        idxs = semantic_buckets.get("what", [])
+        if not idxs:
+            idxs = pattern_bank.get("definition", [])
+        plan["candidate_idxs"] = idxs or list(range(0, 0))
+        plan["k"] = 1
+
+    else:
+        plan["candidate_idxs"] = list(range(0, 0))
+        plan["k"] = 2
+
+    return plan
+
+def node_collect_evidence(
+    query: str,
+    plan: Dict,
+    sentences: List[str],
+    scores: List[float],
+) -> List[Tuple[int, str]]:
+    if not sentences:
+        return []
+    candidate_idxs = plan["candidate_idxs"]
     if not candidate_idxs:
         candidate_idxs = list(range(len(sentences)))
-
-    # 2) K per type
-    if qtype == "who":
-        K = 2
-    elif qtype in ("why", "how"):
-        K = max_k
-    elif qtype == "what_happened":
-        K = min(2, max_k)
-    elif qtype == "what":
-        K = 1
-    else:
-        K = min(2, max_k)
-
-    K = max(1, min(K, len(candidate_idxs)))
-
-    ranked = sorted(candidate_idxs, key=lambda i: scores[i], reverse=True)[:K]
+    k = plan["k"]
+    k = max(1, min(k, len(candidate_idxs)))
+    ranked = sorted(candidate_idxs, key=lambda i: scores[i], reverse=True)[:k]
     ranked = sorted(ranked)
     return [(i, sentences[i]) for i in ranked]
+
+def node_reason(qmeta: Dict[str, str], fused_fact_text: str) -> str:
+    qtype = qmeta["qtype"]
+    base = fused_fact_text.strip()
+    if not base:
+        return base
+
+    if base[-1] not in ".!?":
+        base += "."
+    # Just return the facts here; reasoning structure is handled in generation prompt
+    return base
 
 def humanize_and_generate(
     fused_fact_text: str,
@@ -751,6 +771,28 @@ def humanize_and_generate(
         gen += "."
     return gen
 
+def node_generate_answer(
+    query: str,
+    fused_fact_text: str,
+    lm_model,
+    lm_vocab,
+    lm_max_len,
+    compressed_sents,
+    device,
+) -> str:
+    qmeta = node_classify_query(query)
+    reasoned_facts = node_reason(qmeta, fused_fact_text)
+    return humanize_and_generate(
+        reasoned_facts,
+        query,
+        lm_model,
+        lm_vocab,
+        lm_max_len,
+        compressed_sents,
+        device,
+    )
+
+# ---------------- DOCUMENT LOADING ----------------
 def load_document(file) -> str:
     if not file:
         return ""
@@ -766,23 +808,7 @@ def load_document(file) -> str:
             return ""
     return ""
 
-# ---------------- Streamlit UI & state ----------------
-st.set_page_config(page_title="Hierarchical Doc QA", layout="wide")
-st.markdown("""
-<style>
-html, body, .stApp { background-color:#202123 !important; color:#ECECEC !important; }
-.main-container { max-width: 1100px; margin:auto; padding:8px; }
-section[data-testid="stSidebar"] { background-color:#202123 !important; border-right:1px solid #2f3136 !important; }
-section[data-testid="stSidebar"] * { color:#ECECEC !important; }
-textarea, input[type="text"] { background-color:#343541 !important; color:#ECECEC !important; border-radius:8px; border:1px solid #565869; }
-textarea::placeholder, input[type="text"]::placeholder { color:#9FA0A5 !important; }
-[data-testid="stFileUploader"] { background-color:#343541 !important; border-radius:8px; border:1px dashed #565869 !important; }
-[data-testid="stFileUploader"] * { color:#ECECEC !important; }
-.stButton > button { background-color:#10A37F !important; color:white !important; border-radius:6px; border:none; }
-.debug-box { background:#1f1f1f;border-radius:8px;border:1px solid #333;padding:8px;font-size:13px;color:#ddd; }
-</style>
-""", unsafe_allow_html=True)
-
+# ---------------- STREAMLIT STATE ----------------
 if "S" not in st.session_state:
     st.session_state.S = {
         "raw_text": "",
@@ -791,6 +817,7 @@ if "S" not in st.session_state:
         "compressed_summary": "",
         "semantic_tags": [],
         "semantic_buckets": {"what": [], "how": [], "why": [], "who": []},
+        "pattern_bank": {"causal": [], "process": [], "definition": [], "entity": []},
         "embed_vocab": None,
         "embed_model": None,
         "embed_max_len": 48,
@@ -809,6 +836,7 @@ if "S" not in st.session_state:
 
 S = st.session_state.S
 
+# ---------------- SIDEBAR & HEADER ----------------
 with st.sidebar:
     st.header("Upload & Settings")
     up = st.file_uploader("Upload TXT or PDF", type=["txt", "pdf"])
@@ -819,10 +847,10 @@ with st.sidebar:
 st.markdown("<div class='main-container'>", unsafe_allow_html=True)
 st.title("🧠 Hierarchical WHAT / HOW / WHY / WHO Doc Chatbot (Offline PyTorch)")
 st.write(
-    "- Compresses document into de-duplicated key sentences\n"
-    "- Tags each sentence with what/how/why/who semantics\n"
-    "- Uses a small cross-encoder + hierarchical buckets for retrieval\n"
-    "- Generates expressive, fact-locked answers guided by the question type"
+    "- Exhaustive light analysis into semantic buckets and patterns\n"
+    "- Cross-encoder retrieves the most relevant summary sentences\n"
+    "- LangGraph-style orchestration routes by question type\n"
+    "- Tiny PyTorch transformer generates expressive, fact-locked answers"
 )
 
 def need_rebuild(name: Optional[str], ep: int, slen: int) -> bool:
@@ -834,7 +862,7 @@ def need_rebuild(name: Optional[str], ep: int, slen: int) -> bool:
         or S["last_epochs"] != ep
     )
 
-# ---------------- pipeline build ----------------
+# ---------------- PIPELINE BUILD ----------------
 if up and need_rebuild(up.name, epochs, summary_len):
     S["last_file"] = up.name
     S["last_summary_len"] = summary_len
@@ -844,6 +872,7 @@ if up and need_rebuild(up.name, epochs, summary_len):
     S["compressed_summary"] = ""
     S["semantic_tags"] = []
     S["semantic_buckets"] = {"what": [], "how": [], "why": [], "who": []}
+    S["pattern_bank"] = {"causal": [], "process": [], "definition": [], "entity": []}
     S["embed_vocab"] = None
     S["embed_model"] = None
     S["cross_vocab"] = None
@@ -929,6 +958,9 @@ if up and need_rebuild(up.name, epochs, summary_len):
                 S["semantic_tags"] = tags_per_sent
                 S["semantic_buckets"] = buckets
 
+                pattern_bank = build_pattern_bank(compressed_sents, tags_per_sent)
+                S["pattern_bank"] = pattern_bank
+
             cross_train_sents = list(dict.fromkeys(compressed_sents + all_sents))
             cross_vocab = build_vocab(cross_train_sents)
             S["cross_vocab"] = cross_vocab
@@ -978,20 +1010,20 @@ if up and need_rebuild(up.name, epochs, summary_len):
                     )
                 S["lm_model"] = lm_model
 
-            st.success("Document processed. Summary and models are ready.")
+            st.success("Document processed. Summary, patterns, and models are ready.")
 
-# ---------------- summary display ----------------
+# ---------------- SUMMARY DISPLAY ----------------
 if S.get("compressed_summary"):
-    st.markdown("### 📄 Compressed Summary")
+    st.markdown("### 📄 Compressed Semantic Summary")
     st.text_area("Summary", S["compressed_summary"], height=220)
 
-# ---------------- chat ----------------
-st.markdown("### 💬 Ask about the compressed summary")
+# ---------------- CHAT ----------------
+st.markdown("### 💬 Ask about the document")
 for role, msg in S["messages"]:
     with st.chat_message(role):
         st.markdown(msg)
 
-user_q = st.chat_input("Ask a question about the document...")
+user_q = st.chat_input("Ask a question (what / how / why / who) about the document...")
 
 if user_q:
     S["messages"].append(("user", user_q))
@@ -1012,34 +1044,36 @@ if user_q:
                 S["cross_max_len"],
                 S["device"],
             )
-            top_items = choose_dynamic_top_k(
-                user_q,
-                S["compressed_sents"],
-                scores,
-                max_k=3,
-                semantic_buckets=S.get("semantic_buckets", {"what": [], "how": [], "why": [], "who": []}),
-            )
+
+            qmeta = node_classify_query(user_q)
+            plan = node_plan_retrieval(qmeta, S["semantic_buckets"], S["pattern_bank"])
+            top_items = node_collect_evidence(user_q, plan, S["compressed_sents"], scores)
+
             if not top_items:
                 answer = "I couldn't identify any specific sentences in the summary for that question."
             else:
                 _, top_sents = zip(*top_items)
                 fused_fact = ". ".join(s.strip().rstrip(".") for s in top_sents) + "."
-                answer = humanize_and_generate(
-                    fused_fact,
+                answer = node_generate_answer(
                     user_q,
+                    fused_fact,
                     S["lm_model"],
                     S["lm_vocab"],
                     S["lm_max_len"],
                     S["compressed_sents"],
                     S["device"],
                 )
+
             if debug:
-                st.markdown("#### 🔍 Debug: Sentence Scores & Selected")
+                st.markdown("#### 🔍 Debug: Retrieval Plan & Selected Sentences")
                 lines = []
+                candidate = plan["candidate_idxs"]
+                lines.append(f"QType: {qmeta['qtype']}")
+                lines.append(f"Plan candidate idxs: {candidate}")
                 selected_indices = {i for i, _ in top_items} if top_items else set()
                 for i, s in enumerate(S["compressed_sents"]):
                     mark = "⭐" if i in selected_indices else "•"
-                    lines.append(f"{mark} {scores[i]:.4f}: {s}")
+                    lines.append(f"{mark} {i:03d} | {scores[i]:.4f}: {s}")
                 st.markdown(
                     "<div class='debug-box'>" + "<br>".join(lines) + "</div>",
                     unsafe_allow_html=True,
