@@ -97,6 +97,21 @@ def extract_json(raw_text):
     return match.group(0) if match else None
 
 # ----------------------------------------------------------
+# Dynamic Card Renderer
+# ----------------------------------------------------------
+def render_dynamic_cards(scenarios, container):
+    container.empty()
+    with container:
+        st.markdown("### 📑 Migration Scenarios (Live Update)")
+        for i, scenario in enumerate(scenarios, start=1):
+            with st.expander(f"🔹 Scenario {i}: {scenario.get('approach','Unknown')}", expanded=False):
+                keys = list(scenario.keys())
+                cols = st.columns(min(len(keys), 3))  # Adaptive columns
+                for idx, key in enumerate(keys):
+                    col = cols[idx % len(cols)]
+                    col.markdown(f"<span style='color:#2E86C1;font-weight:bold;'>{key.capitalize()}:</span> {scenario.get(key,'N/A')}", unsafe_allow_html=True)
+
+# ----------------------------------------------------------
 # Migration Planner UI
 # ----------------------------------------------------------
 st.subheader("📋 Migration Details")
@@ -110,8 +125,11 @@ if st.button("Generate Migration Plan"):
         st.warning("Please provide infrastructure details and constraints.")
     else:
         st.info("Streaming response from Claude...")
-        placeholder = st.empty()
+        raw_col, structured_col = st.columns([1, 1])
+        raw_placeholder = raw_col.empty()
+        structured_placeholder = structured_col.empty()
         progress = st.progress(0)
+
         streamed_text = ""
         token_count = 0
 
@@ -125,37 +143,33 @@ if st.button("Generate Migration Plan"):
 
             token_count += 1
             progress.progress(min(token_count / 100, 1.0))  # Simulate progress
-            placeholder.markdown(f"```\n{streamed_text}\n```")
+            raw_placeholder.markdown(f"```\n{streamed_text}\n```")
+
+            # Try parsing progressively
+            json_text = extract_json(streamed_text)
+            if json_text:
+                try:
+                    scenarios = json.loads(json_text)
+                    render_dynamic_cards(scenarios, structured_placeholder)
+                except:
+                    pass  # Ignore until valid JSON forms
 
         progress.empty()  # Remove progress bar after streaming
 
-        # Try parsing JSON after streaming completes
+        # Final parse after streaming completes
         json_text = extract_json(streamed_text)
         if json_text:
             try:
                 scenarios = json.loads(json_text)
                 st.session_state["migration_plan"] = scenarios
-                st.success("✅ Migration Plan Generated!")
-
-                # ----------------------------------------------------------
-                # Adaptive UX Display
-                # ----------------------------------------------------------
-                st.markdown("### 📑 Migration Scenarios")
-                for i, scenario in enumerate(scenarios, start=1):
-                    with st.expander(f"🔹 Scenario {i}: {scenario.get('approach','Unknown')}", expanded=False):
-                        # Dynamically render all keys
-                        keys = list(scenario.keys())
-                        cols = st.columns(2)
-                        for idx, key in enumerate(keys):
-                            col = cols[idx % 2]
-                            col.markdown(f"<span style='color:#2E86C1;font-weight:bold;'>{key.capitalize()}:</span> {scenario.get(key,'N/A')}", unsafe_allow_html=True)
-                        st.divider()
+                st.success("✅ Final Migration Plan Generated!")
+                render_dynamic_cards(scenarios, structured_placeholder)
             except json.JSONDecodeError:
                 st.error("Failed to parse JSON. Showing raw streamed response:")
-                st.write(streamed_text)
+                raw_placeholder.write(streamed_text)
         else:
             st.error("Claude did not return valid JSON. Showing raw streamed response:")
-            st.write(streamed_text)
+            raw_placeholder.write(streamed_text)
 
 # ----------------------------------------------------------
 # Download Button
@@ -164,4 +178,5 @@ if "migration_plan" in st.session_state:
     st.download_button(
         "⬇️ Download Migration Plan",
         data=json.dumps(st.session_state["migration_plan"], indent=2),
-        file_name="migration_plan.json")
+        file_name="migration_plan.json"
+    )
