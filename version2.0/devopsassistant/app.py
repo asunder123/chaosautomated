@@ -1,16 +1,17 @@
 
 # ----------------------------------------------------------
-# STREAMLIT APP: Multi-Model CLI Generator with Adaptive Router & Incremental Retraining
+# STREAMLIT APP: CLI Generator with Local Embeddings + RAG + Incremental Retraining
 # ----------------------------------------------------------
 import streamlit as st
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import math
-from torch.nn.utils.rnn import pad_sequence
+import faiss
+import numpy as np
 import os
 import pickle
-import numpy as np
+from torch.nn.utils.rnn import pad_sequence
 
 # ==========================================================
 # CONFIG
@@ -19,6 +20,7 @@ MODEL_DIR = "models"
 CORRECTION_DIR = "corrections"
 os.makedirs(MODEL_DIR, exist_ok=True)
 os.makedirs(CORRECTION_DIR, exist_ok=True)
+
 DOMAINS = ["aws", "k8s", "docker"]
 
 # ==========================================================
@@ -60,58 +62,6 @@ DATASETS = {
 }
 
 # ==========================================================
-# Domain Keywords for Router
-# ==========================================================
-domain_keywords = {
-    "aws": ["aws", "s3", "ec2", "iam", "lambda", "cloudformation"],
-    "k8s": ["kubectl", "pod", "pods", "deployment", "namespace", "rollout"],
-    "docker": ["docker", "container", "image", "compose", "volume", "network"]
-}
-
-# ==========================================================
-# Router Embedding
-# ==========================================================
-class RouterEmbedding(nn.Module):
-    def __init__(self, vocab_size, embed_dim=64):
-        super().__init__()
-        self.embedding = nn.Embedding(vocab_size, embed_dim)
-
-    def forward(self, ids):
-        return self.embedding(ids)
-
-router_vocab = sorted(set(word for words in domain_keywords.values() for word in words))
-router_stoi = {w: i for i, w in enumerate(router_vocab)}
-router_itos = {i: w for w, i in router_stoi.items()}
-
-router_model = RouterEmbedding(len(router_vocab))
-
-def compute_domain_embeddings():
-    domain_embeds = {}
-    for domain, words in domain_keywords.items():
-        ids = torch.tensor([router_stoi.get(w, 0) for w in words])
-        emb = router_model(ids).mean(dim=0)
-        emb = F.normalize(emb, p=2, dim=0)
-        domain_embeds[domain] = emb
-    return domain_embeds
-
-domain_embeddings = compute_domain_embeddings()
-
-def refresh_router_embeddings():
-    global domain_embeddings
-    domain_embeddings = compute_domain_embeddings()
-
-def detect_domain_fuzzy(prompt):
-    tokens = [w for w in prompt.lower().split() if w in router_stoi]
-    if not tokens:
-        return None, 0.0
-    ids = torch.tensor([router_stoi.get(w, 0) for w in tokens])
-    prompt_emb = router_model(ids).mean(dim=0)
-    prompt_emb = F.normalize(prompt_emb, p=2, dim=0)
-    sims = {d: torch.cosine_similarity(prompt_emb, emb, dim=0).item() for d, emb in domain_embeddings.items()}
-    best_domain = max(sims, key=sims.get)
-    return best_domain, sims[best_domain]
-
-# ==========================================================
 # Tokenizer
 # ==========================================================
 class Tokenizer:
@@ -146,10 +96,35 @@ class Tokenizer:
         return len(self.vocab)
 
 # ==========================================================
+# Local Embedding Model
+# ==========================================================
+class PromptEmbedding(nn.Module):
+    def __init__(self, vocab_size, embed_dim=128):
+        super().__init__()
+        self.embedding = nn.Embedding(vocab_size, embed_dim)
+
+    def forward(self, token_ids):
+        emb = self.embedding(token_ids)
+        return emb.mean(dim=0)  # Mean pooling
+
+# ==========================================================
 # Transformer Model
 # ==========================================================
+class PositionalEncoding(nn.Module):
+    def __init__(self, dim, max_len=5000):
+        super().__init__()
+        pe = torch.zeros(max_len, dim)
+        pos = torch.arange(max_len).unsqueeze(1)
+        div = torch.exp(torch.arange(0, dim, 2) * -(math.log(10000) / dim))
+        pe[:, 0::2] = torch.sin(pos * div)
+        pe[:, 1::2] = torch.cos(pos * div)
+        self.register_buffer("pe", pe.unsqueeze(1))
+
+    def forward(self, x):
+        return x + self.pe[: x.size(0)]
+
 class CLITransformer(nn.Module):
-    def __init__(self, src_vocab, tgt_vocab, dim=512, nhead=8, num_layers=6, dropout=0.4):
+    def __init__(self, src_vocab, tgt_vocab, dim=512, nhead=8, num_layers=6, dropout=0.3):
         super().__init__()
         self.src_emb = nn.Embedding(src_vocab, dim)
         self.tgt_emb = nn.Embedding(tgt_vocab, dim)
@@ -173,19 +148,6 @@ class CLITransformer(nn.Module):
 
     def decode(self, ys, mem, mask):
         return self.decoder(self.pos(self.tgt_emb(ys)), mem, tgt_mask=mask)
-
-class PositionalEncoding(nn.Module):
-    def __init__(self, dim, max_len=5000):
-        super().__init__()
-        pe = torch.zeros(max_len, dim)
-        pos = torch.arange(max_len).unsqueeze(1)
-        div = torch.exp(torch.arange(0, dim, 2) * -(math.log(10000) / dim))
-        pe[:, 0::2] = torch.sin(pos * div)
-        pe[:, 1::2] = torch.cos(pos * div)
-        self.register_buffer("pe", pe.unsqueeze(1))
-
-    def forward(self, x):
-        return x + self.pe[: x.size(0)]
 
 def mask(sz):
     m = torch.triu(torch.ones(sz, sz), 1).bool()
@@ -249,25 +211,52 @@ def retrain_with_corrections(domain):
                     corrections.append((p, c))
 
     if not corrections:
-        return None, None, None
+        return None
 
-    corrections = list(set(corrections))  # Deduplicate
     combined_data = DATASETS[domain] + corrections
     s_tok = Tokenizer([s for s, _ in combined_data])
     t_tok = Tokenizer([t for _, t in combined_data])
-
-    model = CLITransformer(s_tok.vocab_size, t_tok.vocab_size)
-    model = train(combined_data, s_tok, t_tok, model=model, epochs=20, lr=1e-4)
-
+    model = train(combined_data, s_tok, t_tok, epochs=30, lr=1e-4)
     save_model(domain, model, s_tok, t_tok)
-    refresh_router_embeddings()
-    return model, s_tok, t_tok
+    return model
 
 # ==========================================================
-# Beam Search with Stronger Constraints
+# FAISS Retrieval with Local Embeddings
 # ==========================================================
-def beam_search(model, s_tok, t_tok, prompt, beam_width=3, max_len=15, repetition_penalty=2.0):
-    src = torch.tensor(s_tok.encode(prompt)).unsqueeze(1)
+def compute_embeddings(prompts, tok, embed_model):
+    vectors = []
+    for p in prompts:
+        ids = torch.tensor(tok.encode(p))
+        vec = embed_model(ids).detach().numpy()
+        vectors.append(vec)
+    return np.vstack(vectors)
+
+def build_faiss_index(domain, tok, embed_model):
+    data = DATASETS[domain]
+    prompts = [p for p, _ in data]
+    embeddings = compute_embeddings(prompts, tok, embed_model)
+    dim = embeddings.shape[1]
+    index = faiss.IndexFlatL2(dim)
+    index.add(embeddings)
+    faiss.write_index(index, f"{MODEL_DIR}/{domain}_index.faiss")
+    with open(f"{MODEL_DIR}/{domain}_prompts.pkl", "wb") as f:
+        pickle.dump(prompts, f)
+
+def retrieve_examples(domain, query, tok, embed_model, k=3):
+    index = faiss.read_index(f"{MODEL_DIR}/{domain}_index.faiss")
+    with open(f"{MODEL_DIR}/{domain}_prompts.pkl", "rb") as f:
+        prompts = pickle.load(f)
+    ids = torch.tensor(tok.encode(query))
+    query_emb = embed_model(ids).detach().numpy().reshape(1, -1)
+    distances, indices = index.search(query_emb, k)
+    return [prompts[idx] for idx in indices[0]]
+
+# ==========================================================
+# Beam Search with RAG
+# ==========================================================
+def beam_search(model, s_tok, t_tok, prompt, retrieved, beam_width=3, max_len=15):
+    rag_context = prompt + " " + " ".join(retrieved)
+    src = torch.tensor(s_tok.encode(rag_context)).unsqueeze(1)
     mem = model.encode(src)
 
     beams = [(torch.tensor([[t_tok.bos]]), 0.0)]
@@ -279,113 +268,62 @@ def beam_search(model, s_tok, t_tok, prompt, beam_width=3, max_len=15, repetitio
             logits = model.fc(dec[-1])
             probs = torch.log_softmax(logits, dim=-1)
 
-            tokens = seq.squeeze().tolist()
-            if isinstance(tokens, int):
-                tokens = [tokens]
-
-            # Apply repetition penalty
-            for token in set(tokens):
-                probs[0][token] /= repetition_penalty
-
             topk = torch.topk(probs, beam_width)
             for idx, val in zip(topk.indices[0], topk.values[0]):
                 new_seq = torch.cat([seq, torch.tensor([[idx]])], dim=0)
-                # Coverage penalty: discourage repeats
-                penalty = 0.1 * (len(tokens) - len(set(tokens)))
-                new_beams.append((new_seq, score + val.item() - penalty))
-
+                new_beams.append((new_seq, score + val.item()))
         beams = sorted(new_beams, key=lambda x: x[1], reverse=True)[:beam_width]
 
-        # Stop if EOS or repeated token pattern
-        tokens = beams[0][0].squeeze().tolist()
-        if isinstance(tokens, int):
-            tokens = [tokens]
-        if beams[0][0][-1].item() == t_tok.eos or len(set(tokens)) < len(tokens):
+        if beams[0][0][-1].item() == t_tok.eos:
             break
 
     best_seq = beams[0][0].squeeze(1).tolist()
-    return t_tok.decode(best_seq), np.exp(beams[0][1] / len(best_seq))
+    return t_tok.decode(best_seq)
 
 # ==========================================================
 # STREAMLIT UI
 # ==========================================================
-st.title("⚡ Multi-Model CLI Generator with Adaptive Router & Incremental Retraining")
-
-if "prompt" not in st.session_state:
-    st.session_state["prompt"] = "scale deployment myapp to 3 replicas"
-if "correction_text" not in st.session_state:
-    st.session_state["correction_text"] = ""
-if "domain" not in st.session_state:
-    st.session_state["domain"] = None
+st.title("⚡ CLI Generator with Local Embeddings + RAG + Incremental Retraining")
 
 if st.button("Train All Models"):
-    st.info("Training models for AWS, Kubernetes, and Docker...")
+    st.info("Training models and building FAISS indexes...")
     for domain in DOMAINS:
         data = DATASETS[domain]
         s_tok = Tokenizer([s for s, _ in data])
         t_tok = Tokenizer([t for _, t in data])
         model = train(data, s_tok, t_tok, epochs=50)
         save_model(domain, model, s_tok, t_tok)
-    refresh_router_embeddings()
-    st.success("Training completed!")
 
-st.session_state["prompt"] = st.text_input("Describe your task:", value=st.session_state["prompt"])
+        # Build FAISS index with local embeddings
+        embed_model = PromptEmbedding(s_tok.vocab_size)
+        build_faiss_index(domain, s_tok, embed_model)
+    st.success("Training and FAISS indexing completed!")
+
+prompt = st.text_input("Describe your task:", value="scale deployment myapp to 3 replicas")
+domain = st.selectbox("Select Domain:", DOMAINS)
 
 if st.button("Generate Command"):
-    prompt = st.session_state["prompt"].strip()
-    if not prompt:
-        st.error("Please enter a prompt.")
+    model, s_tok, t_tok = load_model(domain)
+    if not model:
+        st.error(f"Model for {domain} not trained yet.")
     else:
-        domain, confidence = detect_domain_fuzzy(prompt)
-        if not domain:
-            st.error("Could not detect domain.")
-        else:
-            st.session_state["domain"] = domain
-            st.write(f"Detected Domain: **{domain.upper()}** (Confidence: {confidence:.2f})")
-            model, s_tok, t_tok = load_model(domain)
-            if not model:
-                st.error(f"Model for {domain} not trained yet.")
-            else:
-                cmd, conf = beam_search(model, s_tok, t_tok, prompt)
-                st.success(f"Generated Command: `{cmd}`")
-                st.write(f"Generation Confidence: `{conf:.2f}`")
+        embed_model = PromptEmbedding(s_tok.vocab_size)
+        retrieved = retrieve_examples(domain, prompt, s_tok, embed_model)
+        st.write(f"Retrieved Examples: {retrieved}")
+        cmd = beam_search(model, s_tok, t_tok, prompt, retrieved)
+        st.success(f"Generated Command: `{cmd}`")
 
-st.session_state["correction_text"] = st.text_input("Provide correct command (optional):", value=st.session_state["correction_text"])
-
+# Correction submission
+correction = st.text_input("Provide correct command (optional):", value="")
 if st.button("Submit Correction"):
-    correction = st.session_state["correction_text"].strip()
-    prompt = st.session_state["prompt"].strip()
-
-    if correction and prompt:
-        if not st.session_state["domain"]:
-            st.error("Please generate a command first to detect the domain.")
+    if correction.strip() and prompt.strip():
+        with open(f"{CORRECTION_DIR}/{domain}_corrections.txt", "a") as f:
+            f.write(f"{prompt}|||{correction}\n")
+        st.info("✅ Correction saved. Retraining model with ALL corrections...")
+        model = retrain_with_corrections(domain)
+        if model:
+            st.success("Model updated with corrections! Try generating again.")
         else:
-            domain = st.session_state["domain"]
-            with open(f"{CORRECTION_DIR}/{domain}_corrections.txt", "a") as f:
-                f.write(f"{prompt}|||{correction}\n")
-            st.info("✅ Correction saved. Retraining model with ALL corrections...")
-            model, s_tok, t_tok = retrain_with_corrections(domain)
-            if model:
-                st.success("Model updated with all corrections! Try generating again.")
-            else:
-                st.warning("No corrections found for retraining.")
+            st.warning("No corrections found for retraining.")
     else:
         st.warning("Please provide a valid correction and prompt before submitting.")
-
-if st.session_state["domain"]:
-    domain = st.session_state["domain"]
-    st.subheader(f"📜 Saved Corrections for {domain.upper()}")
-    correction_file = f"{CORRECTION_DIR}/{domain}_corrections.txt"
-    if os.path.exists(correction_file):
-        with open(correction_file, "r") as f:
-            corrections = f.readlines()
-        if corrections:
-            for idx, line in enumerate(corrections, 1):
-                st.write(f"{idx}. {line.strip()}")
-            if st.button("Clear All Corrections"):
-                os.remove(correction_file)
-                st.warning(f"All corrections for {domain.upper()} have been cleared.")
-        else:
-            st.write("No corrections saved yet.")
-    else:
-        st.write("No corrections file found for this domain.")
