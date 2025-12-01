@@ -69,6 +69,7 @@ def stream_plan(infra_details: str, constraints: str, model_id: str):
         - Timeline
         - Risks
         - Compliance considerations
+        - Include any additional relevant categories dynamically (e.g., security, performance, automation)
 
         Return ONLY valid JSON. Do not include any text outside the JSON.
         Format:
@@ -78,7 +79,9 @@ def stream_plan(infra_details: str, constraints: str, model_id: str):
             "cost": "...",
             "timeline": "...",
             "risks": "...",
-            "compliance": "..."
+            "compliance": "...",
+            "security": "...",
+            "performance": "..."
           }}
         ]
         """)
@@ -135,19 +138,17 @@ if st.button("Generate Migration Plan"):
                 st.success("✅ Migration Plan Generated!")
 
                 # ----------------------------------------------------------
-                # Enhanced UX Display
+                # Adaptive UX Display
                 # ----------------------------------------------------------
                 st.markdown("### 📑 Migration Scenarios")
                 for i, scenario in enumerate(scenarios, start=1):
                     with st.expander(f"🔹 Scenario {i}: {scenario.get('approach','Unknown')}", expanded=False):
-                        col1, col2 = st.columns(2)
-                        with col1:
-                            st.markdown(f"<span style='color:#2E86C1;font-weight:bold;'>Approach:</span> {scenario.get('approach','N/A')}", unsafe_allow_html=True)
-                            st.markdown(f"<span style='color:#28B463;font-weight:bold;'>Cost:</span> {scenario.get('cost','N/A')}", unsafe_allow_html=True)
-                            st.markdown(f"<span style='color:#F39C12;font-weight:bold;'>Timeline:</span> {scenario.get('timeline','N/A')}", unsafe_allow_html=True)
-                        with col2:
-                            st.markdown(f"<span style='color:#C0392B;font-weight:bold;'>Risks:</span> {scenario.get('risks','N/A')}", unsafe_allow_html=True)
-                            st.markdown(f"<span style='color:#8E44AD;font-weight:bold;'>Compliance:</span> {scenario.get('compliance','N/A')}", unsafe_allow_html=True)
+                        # Dynamically render all keys
+                        keys = list(scenario.keys())
+                        cols = st.columns(2)
+                        for idx, key in enumerate(keys):
+                            col = cols[idx % 2]
+                            col.markdown(f"<span style='color:#2E86C1;font-weight:bold;'>{key.capitalize()}:</span> {scenario.get(key,'N/A')}", unsafe_allow_html=True)
                         st.divider()
             except json.JSONDecodeError:
                 st.error("Failed to parse JSON. Showing raw streamed response:")
@@ -163,5 +164,4 @@ if "migration_plan" in st.session_state:
     st.download_button(
         "⬇️ Download Migration Plan",
         data=json.dumps(st.session_state["migration_plan"], indent=2),
-        file_name="migration_plan.json"
-    )
+        file_name="migration_plan.json")
