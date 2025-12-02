@@ -2,23 +2,20 @@
 #!/usr/bin/env python
 # app.py
 #
-# Streamlit + LangGraph + AWS Bedrock (Claude 3 Haiku)
-# Monolith → Cloud Factory Refactor Planner (AWS-native edition)
-# Advanced Multi-Cloud Deployment Stub Generator (AWS/GCP/Azure)
+# Streamlit + AWS Bedrock + GitHub Repo Generator
+# Monolith → Cloud Factory Refactor Planner with CI/CD Ready Repo
 
 import os
 import json
 import ast
 import boto3
-from typing import TypedDict, Dict, Any, Optional, List
-
+import zipfile
+from typing import TypedDict, Dict, Any, Optional
 import streamlit as st
-from langgraph.graph import StateGraph, END
 
 # ==============================
-# 1. LangGraph State
+# 1. State Definition
 # ==============================
-
 class RefactorState(TypedDict, total=False):
     raw_code: str
     parsed_code: Dict[str, Any]
@@ -26,160 +23,84 @@ class RefactorState(TypedDict, total=False):
     bedrock_response_raw: str
     structured_plan: Dict[str, Any]
     cloud_factory_mapping: Dict[str, Any]
+    enriched_plan: Dict[str, Any]
     deployment_blueprint: str
+    repo_zip: str
     error: Optional[str]
-
 
 # ==============================
 # 2. Utility Functions
 # ==============================
-
 def safe_json_loads(text: str) -> Dict[str, Any]:
     try:
         return json.loads(text)
     except Exception:
         return {"raw_text": text}
 
-
 def parse_python_code(source: str) -> Dict[str, Any]:
-    result = {
-        "num_lines": len(source.splitlines()),
-        "functions": [],
-        "classes": [],
-        "imports": [],
-        "probable_endpoints": [],
-        "db_keywords": [],
-        "http_keywords": [],
-    }
-
+    result = {"num_lines": len(source.splitlines()), "functions": [], "classes": [], "imports": []}
     try:
         tree = ast.parse(source)
+        for node in ast.walk(tree):
+            if isinstance(node, ast.FunctionDef):
+                result["functions"].append(node.name)
+            elif isinstance(node, ast.ClassDef):
+                result["classes"].append(node.name)
+            elif isinstance(node, ast.Import):
+                for alias in node.names:
+                    result["imports"].append(alias.name)
+            elif isinstance(node, ast.ImportFrom):
+                result["imports"].append(node.module or "")
     except SyntaxError:
-        lower = source.lower()
-        result["db_keywords"] = [k for k in ["select","insert","update","delete","join"] if k in lower]
-        result["http_keywords"] = [k for k in ["flask","django","fastapi","route"] if k in lower]
-        return result
-
-    for node in ast.walk(tree):
-        if isinstance(node, ast.FunctionDef):
-            result["functions"].append(node.name)
-        elif isinstance(node, ast.ClassDef):
-            result["classes"].append(node.name)
-        elif isinstance(node, ast.Import):
-            for alias in node.names:
-                result["imports"].append(alias.name)
-        elif isinstance(node, ast.ImportFrom):
-            module = node.module or ""
-            result["imports"].append(module)
-
-    lower = source.lower()
-    for marker in ["@app.route", "/api/", "router.", "flask", "fastapi"]:
-        if marker in lower:
-            result["probable_endpoints"].append(marker)
-
-    result["db_keywords"] = [k for k in ["select","insert","update","delete","join"] if k in lower]
-    result["http_keywords"] = [k for k in ["flask","django","fastapi","request","response"] if k in lower]
-
+        pass
     return result
-
 
 def infer_domain(parsed_code: Dict[str, Any]) -> Dict[str, Any]:
     funcs = parsed_code.get("functions", [])
-    api_funcs = [f for f in funcs if "route" in f.lower() or "api" in f.lower()]
+    api_funcs = [f for f in funcs if "api" in f.lower() or "route" in f.lower()]
     data_funcs = [f for f in funcs if "db" in f.lower() or "repo" in f.lower()]
     core_funcs = [f for f in funcs if f not in api_funcs + data_funcs]
-
-    domains = []
-    if data_funcs:
-        domains.append({"name": "data-layer", "functions": data_funcs})
-    if api_funcs:
-        domains.append({"name": "api-layer", "functions": api_funcs})
-    if core_funcs:
-        domains.append({"name": "core-domain", "functions": core_funcs})
-
-    return {
-        "candidate_domains": domains,
-        "notes": "Heuristic grouping; will be refined by Claude Haiku."
-    }
-
-
-# ==============================
-# 3. Bedrock Helper
-# ==============================
+    return {"candidate_domains": [
+        {"name": "api-layer", "functions": api_funcs},
+        {"name": "data-layer", "functions": data_funcs},
+        {"name": "core-domain", "functions": core_funcs}
+    ]}
 
 def get_bedrock_client():
-    try:
-        session = boto3.Session(
-            aws_access_key_id=st.session_state.get("aws_access_key_id"),
-            aws_secret_access_key=st.session_state.get("aws_secret_access_key"),
-            aws_session_token=None,
-            region_name=st.session_state.get("aws_region", "us-east-1"),
-        )
-        client = session.client("bedrock-runtime")
-        return client
-    except Exception as e:
-        raise RuntimeError(f"Failed to initialize Bedrock client: {e}")
-
+    session = boto3.Session(
+        aws_access_key_id=st.session_state.get("aws_access_key_id"),
+        aws_secret_access_key=st.session_state.get("aws_secret_access_key"),
+        region_name=st.session_state.get("aws_region", "us-east-1"),
+    )
+    return session.client("bedrock-runtime")
 
 # ==============================
-# 4. LangGraph Node Logic
+# 3. Pipeline Nodes
 # ==============================
-
 def node_parse(state: RefactorState) -> RefactorState:
-    code = state.get("raw_code", "")
-    if not code:
-        return {**state, "error": "No code provided."}
-    parsed = parse_python_code(code)
-    return {**state, "parsed_code": parsed}
-
+    return {**state, "parsed_code": parse_python_code(state["raw_code"])}
 
 def node_domain(state: RefactorState) -> RefactorState:
-    parsed = state.get("parsed_code")
-    if not parsed:
-        return {**state, "error": "Missing parsed code."}
-    domains = infer_domain(parsed)
-    return {**state, "domain_model": domains}
-
+    return {**state, "domain_model": infer_domain(state["parsed_code"])}
 
 def node_bedrock_haiku(state: RefactorState) -> RefactorState:
-    code = state.get("raw_code", "")
-    parsed = state.get("parsed_code", {})
-    domain = state.get("domain_model", {})
-
     client = get_bedrock_client()
-    snippet = code[:8000]
-
     prompt = f"""
-You are an elite cloud modernization expert.
-Generate a structured JSON-only response that outlines a complete
-migration plan for converting a monolithic application into a 
-Cloud-Factory-ready AWS-native architecture.
-
-STRICT JSON RESPONSE with keys:
-- current_diagnostic
-- target_architecture
-- phased_roadmap (array of {{phase, objective, steps[]}})
-- readiness_scores
-- cloud_factory_mapping
-- deployment_blueprint
-
---- MONOLITH CODE SNIPPET ---
-{snippet}
-
---- PARSED CODE ---
-{json.dumps(parsed,indent=2)}
-
---- DOMAIN MODEL ---
-{json.dumps(domain,indent=2)}
+Generate JSON migration plan for AWS-native architecture.
+Keys: current_diagnostic, target_architecture, phased_roadmap, readiness_scores, cloud_factory_mapping, deployment_blueprint.
+Code snippet:
+{state['raw_code']}
+Parsed:
+{json.dumps(state['parsed_code'], indent=2)}
+Domain:
+{json.dumps(state['domain_model'], indent=2)}
 """
-
     body = {
         "anthropic_version": "bedrock-2023-05-31",
         "max_tokens": 2000,
         "temperature": 0.2,
         "messages": [{"role": "user", "content": prompt}]
     }
-
     try:
         response = client.invoke_model(
             modelId="anthropic.claude-3-haiku-20240307-v1:0",
@@ -189,232 +110,180 @@ STRICT JSON RESPONSE with keys:
         )
         raw = json.loads(response["body"].read().decode("utf-8"))
         text = raw["content"][0]["text"]
+        return {**state, "bedrock_response_raw": text, "structured_plan": safe_json_loads(text)}
     except Exception as e:
-        return {**state, "error": f"Bedrock request failure: {e}"}
-
-    structured = safe_json_loads(text)
-    return {**state, "bedrock_response_raw": text, "structured_plan": structured}
-
+        return {**state, "error": str(e)}
 
 def node_cloud_factory(state: RefactorState) -> RefactorState:
-    structured = state.get("structured_plan", {})
-    cf = structured.get("cloud_factory_mapping", {"services": []})
+    cf = state["structured_plan"].get("cloud_factory_mapping", {"services": []})
     return {**state, "cloud_factory_mapping": cf}
 
+def node_enrich_plan(state: RefactorState) -> RefactorState:
+    plan = state["structured_plan"]
+    plan["additional_resources"] = {
+        "Networking": {"InternetGateway": {"Type": "AWS::EC2::InternetGateway"}},
+        "Compute": {"AutoScalingGroup": {"Type": "AWS::AutoScaling::AutoScalingGroup"}},
+        "Storage": {"S3Bucket": {"Type": "AWS::S3::Bucket"}},
+        "IAM": {"InstanceRole": {"Type": "AWS::IAM::Role"}},
+        "Monitoring": {"CloudWatchAlarm": {"Type": "AWS::CloudWatch::Alarm"}}
+    }
+    return {**state, "enriched_plan": plan}
 
 def node_blueprint(state: RefactorState) -> RefactorState:
-    plan = state.get("structured_plan", {})
-    cf = state.get("cloud_factory_mapping", {})
-    phased = plan.get("phased_roadmap", [])
-    target_arch = plan.get("target_architecture", "")
-    readiness = plan.get("readiness_scores", {})
+    bp = f"# Deployment Blueprint\n\n{json.dumps(state['enriched_plan'], indent=2)}"
+    return {**state, "deployment_blueprint": bp}
 
-    lines = ["# AWS Cloud Factory Deployment Blueprint\n\n", "## Target Architecture\n"]
-    lines.append(json.dumps(target_arch, indent=2) + "\n\n" if isinstance(target_arch, (dict, list)) else str(target_arch) + "\n\n")
-
-    lines.append("## Phased Roadmap\n")
-    if isinstance(phased, list):
-        for p in phased:
-            lines.append(f"### {p.get('phase','Unnamed Phase')}")
-            obj = p.get("objective","")
-            lines.append(json.dumps(obj, indent=2) if isinstance(obj,(dict,list)) else f"**Objective:** {obj}")
-            for s in p.get("steps", []):
-                lines.append(f"- {s}")
-            lines.append("")
-    else:
-        lines.append(json.dumps(phased, indent=2))
-
-    lines.append("## Cloud Factory Services\n")
-    for svc in cf.get("services", []):
-        lines.append(f"### {svc.get('name','Unnamed Service')}")
-        lines.append(f"- compute: {svc.get('recommended_compute','N/A')}")
-        lines.append(f"- deps: {svc.get('dependencies','N/A')}")
-        lines.append("")
-
-    lines.append("## Readiness Scores\n")
-    if isinstance(readiness, dict):
-        for k,v in readiness.items():
-            if isinstance(v, dict):
-                lines.append(f"- {k}: {v.get('score','N/A')} / 100")
-                notes = v.get("notes","")
-                lines.append(json.dumps(notes, indent=2) if isinstance(notes,(dict,list)) else f"  - {notes}")
-            else:
-                lines.append(f"- {k}: {v}")
-            lines.append("")
-    else:
-        lines.append(json.dumps(readiness, indent=2))
-
-    return {**state, "deployment_blueprint": "\n".join(lines)}
-
-
-# ==============================
-# 5. Advanced Multi-Cloud Stub Generator
-# ==============================
-
-def generate_stub(plan: Dict[str, Any], provider: str) -> str:
-    cf = plan.get("cloud_factory_mapping", {})
-    services = cf.get("services", [])
-
-    if provider == "AWS":
-        lines = [
-            "AWSTemplateFormatVersion: '2010-09-09'",
-            "Description: Advanced AWS Deployment Template",
-            "Resources:",
-            "  VPC:",
-            "    Type: AWS::EC2::VPC",
-            "    Properties:",
-            "      CidrBlock: 10.0.0.0/16",
-            "  PublicSubnet:",
-            "    Type: AWS::EC2::Subnet",
-            "    Properties:",
-            "      VpcId: !Ref VPC",
-            "      CidrBlock: 10.0.1.0/24",
-            "  SecurityGroup:",
-            "    Type: AWS::EC2::SecurityGroup",
-            "    Properties:",
-            "      GroupDescription: Allow HTTP/HTTPS",
-            "      VpcId: !Ref VPC"
-        ]
-        for svc in services:
-            name = svc.get("name","AppInstance").replace(" ","")
-            compute = svc.get("recommended_compute","t3.micro")
+def generate_stub(plan: Dict[str, Any]) -> str:
+    lines = ["AWSTemplateFormatVersion: '2010-09-09'", "Resources:"]
+    for category, resources in plan.get("additional_resources", {}).items():
+        for name, details in resources.items():
             lines.append(f"  {name}:")
-            lines.append("    Type: AWS::EC2::Instance")
-            lines.append("    Properties:")
-            lines.append(f"      InstanceType: {compute}")
-            lines.append("      ImageId: ami-xxxxxxxx")
-            lines.append("      SubnetId: !Ref PublicSubnet")
-            lines.append("      SecurityGroupIds: [!Ref SecurityGroup]")
-        lines.append("Outputs:")
-        lines.append("  VPCId:")
-        lines.append("    Value: !Ref VPC")
-        return "\n".join(lines)
+            lines.append(f"    Type: {details['Type']}")
+    return "\n".join(lines)
 
-    elif provider == "GCP":
-        lines = [
-            "resources:",
-            "- name: vpc-network",
-            "  type: compute.v1.network",
-            "  properties:",
-            "    autoCreateSubnetworks: true"
-        ]
-        for svc in services:
-            name = svc.get("name","app-instance").replace(" ","-")
-            compute = svc.get("recommended_compute","n1-standard-1")
-            lines.append(f"- name: {name}")
-            lines.append("  type: compute.v1.instance")
-            lines.append("  properties:")
-            lines.append(f"    machineType: zones/us-central1-a/machineTypes/{compute}")
-            lines.append("    disks:")
-            lines.append("    - boot: true")
-            lines.append("      autoDelete: true")
-            lines.append("      initializeParams:")
-            lines.append("        sourceImage: projects/debian-cloud/global/images/family/debian-11")
-            lines.append("    networkInterfaces:")
-            lines.append("    - network: $(ref.vpc-network.selfLink)")
-        return "\n".join(lines)
+def node_generate_repo(state: RefactorState) -> RefactorState:
+    repo_path = "cloud-refactor-repo"
+    os.makedirs(f"{repo_path}/infrastructure/aws", exist_ok=True)
+    os.makedirs(f"{repo_path}/.github/workflows", exist_ok=True)
+    os.makedirs(f"{repo_path}/src/monolith", exist_ok=True)
+    os.makedirs(f"{repo_path}/src/refactored", exist_ok=True)
+    os.makedirs(f"{repo_path}/config", exist_ok=True)
 
-    elif provider == "Azure":
-        lines = [
-            "{",
-            '  "$schema": "https://schema.management.azure.com/schemas/2019-04-01/deploymentTemplate.json#",',
-            '  "contentVersion": "1.0.0.0",',
-            '  "resources": [',
-            '    { "type": "Microsoft.Network/virtualNetworks", "name": "vnet", "properties": { "addressSpace": { "addressPrefixes": ["10.0.0.0/16"] } } },'
-        ]
-        for svc in services:
-            name = svc.get("name","AppVM").replace(" ","")
-            compute = svc.get("recommended_compute","Standard_B1s")
-            lines.append("    {")
-            lines.append('      "type": "Microsoft.Compute/virtualMachines",')
-            lines.append(f'      "name": "{name}",')
-            lines.append('      "properties": {')
-            lines.append(f'        "hardwareProfile": {{"vmSize": "{compute}"}}')
-            lines.append("      }")
-            lines.append("    },")
-        lines.append("  ]")
-        lines.append("}")
-        return "\n".join(lines)
+    # Save original code with UTF-8 encoding
+    with open(f"{repo_path}/src/monolith/app.py", "w", encoding="utf-8") as f:
+        f.write(state["raw_code"])
 
-    return "# Unsupported provider"
+    # Dockerfile
+    dockerfile = """FROM python:3.11-slim
+WORKDIR /app
+COPY src/monolith/ /app
+RUN pip install -r requirements.txt || true
+CMD ["python", "app.py"]
+"""
+    with open(f"{repo_path}/config/Dockerfile", "w", encoding="utf-8") as f:
+        f.write(dockerfile)
 
+    # docker-compose.yaml
+    compose = """version: '3.8'
+services:
+  app:
+    build: ./config
+    ports:
+      - "8080:8080"
+    environment:
+      - ENV=production
+"""
+    with open(f"{repo_path}/config/docker-compose.yaml", "w", encoding="utf-8") as f:
+        f.write(compose)
+
+    # app-config.json
+    config_json = {"ENV": "production", "AWS_REGION": st.session_state.get("aws_region", "us-east-1")}
+    with open(f"{repo_path}/config/app-config.json", "w", encoding="utf-8") as f:
+        json.dump(config_json, f, indent=2)
+
+    # CloudFormation template
+    with open(f"{repo_path}/infrastructure/aws/cloudformation.yaml", "w", encoding="utf-8") as f:
+        f.write(generate_stub(state["enriched_plan"]))
+
+    # README
+    with open(f"{repo_path}/README.md", "w", encoding="utf-8") as f:
+        f.write(state["deployment_blueprint"])
+
+    # GitHub Actions workflow
+    workflow = """name: Deploy
+on: [push]
+jobs:
+  build-and-deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v3
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v2
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: us-east-1
+      - name: Login to ECR
+        run: |
+          aws ecr get-login-password --region us-east-1 | docker login --username AWS --password-stdin <ECR_REPO_URI>
+      - name: Build and Push Docker Image
+        run: |
+          docker build -t cloud-refactor-app ./config
+          docker tag cloud-refactor-app:latest <ECR_REPO_URI>:latest
+          docker push <ECR_REPO_URI>:latest
+      - name: Deploy CloudFormation
+        run: |
+          aws cloudformation deploy \
+            --template-file infrastructure/aws/cloudformation.yaml \
+            --stack-name refactor-stack \
+            --capabilities CAPABILITY_IAM
+"""
+    with open(f"{repo_path}/.github/workflows/deploy.yml", "w", encoding="utf-8") as f:
+        f.write(workflow)
+
+    # Zip repo
+    zip_name = "cloud-refactor-repo.zip"
+    with zipfile.ZipFile(zip_name, 'w') as zipf:
+        for root, _, files in os.walk(repo_path):
+            for file in files:
+                zipf.write(os.path.join(root, file))
+    return {**state, "repo_zip": zip_name}
 
 # ==============================
-# 6. Build LangGraph
+# 4. Streamlit UI
 # ==============================
-
-def build_graph():
-    g = StateGraph(RefactorState)
-    g.add_node("parse", node_parse)
-    g.add_node("domain", node_domain)
-    g.add_node("haiku", node_bedrock_haiku)
-    g.add_node("cf_map", node_cloud_factory)
-    g.add_node("blueprint", node_blueprint)
-    g.set_entry_point("parse")
-    g.add_edge("parse","domain")
-    g.add_edge("domain","haiku")
-    g.add_edge("haiku","cf_map")
-    g.add_edge("cf_map","blueprint")
-    g.add_edge("blueprint", END)
-    return g.compile()
-
-GRAPH = build_graph()
-
-
-# ==============================
-# 7. Streamlit UI
-# ==============================
-
 def main():
     st.set_page_config(page_title="Cloud Refactor Planner", layout="wide")
-    st.title("🏗️ Monolith → Cloud Factory Refactor Planner (AWS Bedrock Version)")
+    st.title("🏗️ Monolith → Cloud Factory Refactor Planner")
 
-    st.sidebar.header("🔐 AWS Credentials")
-    st.session_state.setdefault("aws_access_key_id","")
-    st.session_state.setdefault("aws_secret_access_key","")
-    st.session_state.setdefault("aws_region","us-east-1")
+    # AWS Credentials
+    st.sidebar.header("AWS Credentials")
+    st.session_state.setdefault("aws_access_key_id", "")
+    st.session_state.setdefault("aws_secret_access_key", "")
+    st.session_state.setdefault("aws_region", "us-east-1")
+    st.session_state["aws_access_key_id"] = st.sidebar.text_input("Access Key", st.session_state["aws_access_key_id"])
+    st.session_state["aws_secret_access_key"] = st.sidebar.text_input("Secret Key", st.session_state["aws_secret_access_key"], type="password")
+    st.session_state["aws_region"] = st.sidebar.text_input("Region", st.session_state["aws_region"])
 
-    st.session_state["aws_access_key_id"] = st.sidebar.text_input("AWS Access Key ID", value=st.session_state["aws_access_key_id"])
-    st.session_state["aws_secret_access_key"] = st.sidebar.text_input("AWS Secret Access Key", value=st.session_state["aws_secret_access_key"], type="password")
-    st.session_state["aws_region"] = st.sidebar.text_input("AWS Region", value=st.session_state["aws_region"])
-    st.sidebar.success("Credentials stored in session.")
+    code_text = st.text_area("Paste Monolith Code", height=300)
 
-    st.markdown("### Upload or paste your monolithic code")
-    code_text = st.text_area("Monolith Code", height=300)
-
-    if st.button("🚀 Generate Cloud Factory Refactor Plan"):
+    if st.button("🚀 Generate Plan"):
         if not code_text.strip():
-            st.error("Please provide some code.")
+            st.error("Please provide code.")
             st.stop()
 
-        with st.spinner("Running Bedrock Claude Haiku…"):
-            state = GRAPH.invoke({"raw_code": code_text})
+        progress = st.progress(0)
+        state = {"raw_code": code_text}
 
-        if state.get("error"):
-            st.error(state["error"])
-            st.stop()
+        progress.progress(20, "Parsing...")
+        state = node_parse(state)
+        st.json(state["parsed_code"])
 
-        tab1, tab2, tab3, tab4 = st.tabs(["Parsed", "Claude JSON", "Cloud Factory Mapping", "Blueprint"])
-        with tab1:
-            st.json(state.get("parsed_code"))
-            st.json(state.get("domain_model"))
-        with tab2:
-            st.text(state.get("bedrock_response_raw"))
-            st.json(state.get("structured_plan"))
-        with tab3:
-            st.json(state.get("cloud_factory_mapping"))
-        with tab4:
-            st.markdown(state.get("deployment_blueprint"))
+        progress.progress(40, "Inferring domain...")
+        state = node_domain(state)
+        st.json(state["domain_model"])
 
-        # Multi-Cloud Stub Download
-        st.markdown("### Download Advanced Deployment Stub")
-        provider = st.selectbox("Choose Cloud Provider", ["AWS","GCP","Azure"])
-        stub = generate_stub(state.get("structured_plan", {}), provider)
-        st.download_button(
-            label=f"Download {provider} Deployment Stub",
-            data=stub,
-            file_name=f"{provider.lower()}_deployment_stub.yaml" if provider!="Azure" else f"{provider.lower()}_deployment_stub.json"
-        )
+        progress.progress(60, "Calling Claude Haiku...")
+        state = node_bedrock_haiku(state)
+        st.json(state["structured_plan"])
+
+        progress.progress(75, "Cloud Factory mapping...")
+        state = node_cloud_factory(state)
+        st.json(state["cloud_factory_mapping"])
+
+        progress.progress(85, "Enriching plan...")
+        state = node_enrich_plan(state)
+        st.json(state["enriched_plan"])
+
+        progress.progress(95, "Generating blueprint...")
+        state = node_blueprint(state)
+        st.markdown(state["deployment_blueprint"])
+
+        progress.progress(100, "Creating GitHub repo...")
+        state = node_generate_repo(state)
+        st.success("✅ Repo ready!")
+        with open(state["repo_zip"], "rb") as f:
+            st.download_button("Download GitHub Repo ZIP", f, file_name="cloud-refactor-repo.zip")
 
 if __name__ == "__main__":
     main()

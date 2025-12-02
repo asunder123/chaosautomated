@@ -1,0 +1,24 @@
+name: Deploy
+on: [push]
+jobs:
+  build-and-deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v3
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v2
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: us-east-1
+      - name: Login to ECR
+        run: |
+          aws ecr get-login-password --region us-east-1 | docker login --username AWS --password-stdin <ECR_REPO_URI>
+      - name: Build and Push Docker Image
+        run: |
+          docker build -t cloud-refactor-app ./config
+          docker tag cloud-refactor-app:latest <ECR_REPO_URI>:latest
+          docker push <ECR_REPO_URI>:latest
+      - name: Deploy CloudFormation
+        run: |
+          aws cloudformation deploy             --template-file infrastructure/aws/cloudformation.yaml             --stack-name refactor-stack             --capabilities CAPABILITY_IAM
