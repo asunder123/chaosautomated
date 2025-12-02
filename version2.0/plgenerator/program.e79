@@ -1,0 +1,3 @@
+fn test(a: auto, b: auto, c: auto) -> auto:
+    d = a + b + c
+    return d
