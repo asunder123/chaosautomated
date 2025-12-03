@@ -1,326 +1,357 @@
+##############################################################
+# OFFLINE SEMANTICALLY-GATED RAG (FAISS + Transformer Failover)
+# Now with PDF + TXT ingestion
+##############################################################
 
 import os
-import math
-import psutil
+from typing import List, Tuple
+
+import numpy as np
 import streamlit as st
 import torch
 import torch.nn as nn
-from torch.utils.data import Dataset, DataLoader
-import faiss
+
+##############################################################
+# SAFE PAGE CONFIG
+##############################################################
+def safe_page_config():
+    try:
+        st.set_page_config(
+            page_title="Semantic-Gated RAG (TXT + PDF)",
+            layout="wide"
+        )
+    except:
+        pass
+
+safe_page_config()
+
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+##############################################################
+# SPACY
+##############################################################
 import spacy
-from langgraph.graph import Graph
-import string
 
-# ================================
-# DARK MODE CONFIG
-# ================================
-st.set_page_config(page_title="Enterprise Mobility RAG Assistant", layout="wide")
-
-DARK_CSS = """
-<style>
-body, html, .stApp {
-    background-color: #0D0D0D !important;
-    color: white !important;
-}
-input, textarea, select {
-    background-color: #1E1E1E !important;
-    color: white !important;
-    border-radius: 8px;
-}
-div.stButton > button {
-    background-color: #333333 !important;
-    color: white !important;
-    border: 1px solid #555555 !important;
-    border-radius: 6px;
-}
-</style>
-"""
-st.markdown(DARK_CSS, unsafe_allow_html=True)
-
-# ================================
-# ENTERPRISE APP DETECTION
-# ================================
-ENTERPRISE_APPS = ["GTD", "GetTALENT", "Workday", "SuccessFactors"]
-
-def get_desktop_context():
+@st.cache_resource
+def load_spacy_model():
     try:
-        cpu = psutil.cpu_percent(interval=0.5)
-        ram = psutil.virtual_memory().percent
-        disk = psutil.disk_usage("/").percent
-        detected_apps = []
-        for p in psutil.process_iter(["name"]):
-            pname = p.info.get("name", "")
-            for app in ENTERPRISE_APPS:
-                if app.lower() in pname.lower():
-                    detected_apps.append(app)
-        txt = f"System Context:\nCPU {cpu:.1f}% | RAM {ram:.1f}% | Disk {disk:.1f}%\n"
-        if detected_apps:
-            txt += f"Detected Enterprise Apps: {', '.join(set(detected_apps))}\n"
-        return txt
+        return spacy.load("en_core_web_sm")
     except:
-        return "System context unavailable."
+        return None
 
-# ================================
-# FILE LOADING
-# ================================
-def load_text(upload):
-    name = upload.name.lower()
-    try:
-        if name.endswith(".txt"):
-            return upload.read().decode("utf-8", "ignore")
-        if name.endswith(".pdf"):
-            import PyPDF2
-            reader = PyPDF2.PdfReader(upload)
-            return "\n".join(page.extract_text() or "" for page in reader.pages)
-        if name.endswith(".docx"):
-            import docx
-            d = docx.Document(upload)
-            return "\n".join(p.text for p in d.paragraphs)
-    except:
-        return ""
-    return ""
+nlp = load_spacy_model()
 
-# ================================
-# TOKENIZER / VOCAB
-# ================================
-SPECIAL = {"PAD": 0, "BOS": 1, "EOS": 2, "UNK": 3}
+##############################################################
+# FAISS
+##############################################################
+try:
+    import faiss
+except:
+    faiss = None
+    st.warning("FAISS not installed — fallback to brute force.")
 
-def tokenize(text): return text.split()
+##############################################################
+# PRIMARY ENGINE: FAISS RAG
+##############################################################
+class ExtractiveRAG:
+    def __init__(self, nlp_model):
+        self.nlp = nlp_model
+        self.sentences = []
+        self.index = None
+        self.vecs = None
+        self.dim = None
 
-def build_vocab(texts):
-    freq = {}
-    for t in texts:
-        for tok in tokenize(t):
-            freq[tok] = freq.get(tok, 0) + 1
-    token2id = dict(SPECIAL)
-    id2token = {v: k for k, v in token2id.items()}
-    idx = len(token2id)
-    for tok in freq.keys():
-        token2id[tok] = idx
-        id2token[idx] = tok
-        idx += 1
-    return token2id, id2token
+    def _embed(self, text):
+        doc = self.nlp(text)
+        vec = doc.vector
+        if vec is None or vec.shape[0] == 0:
+            return np.zeros(self.dim if self.dim else 300, dtype="float32")
+        return vec.astype("float32")
 
-def encode(text, token2id):
-    ids = [SPECIAL["BOS"]] + [token2id.get(t, SPECIAL["UNK"]) for t in tokenize(text)] + [SPECIAL["EOS"]]
-    return ids
+    def build(self, corpus):
+        sents = []
+        for para in corpus.split("\n\n"):
+            para = para.strip()
+            if not para:
+                continue
+            doc = self.nlp(para)
+            for s in doc.sents:
+                t = s.text.strip()
+                if len(t) > 25:
+                    sents.append(t)
 
-# ================================
-# DATASET
-# ================================
-class LMData(Dataset):
-    def __init__(self, ids, seq_len):
-        self.data = [ids[i:i+seq_len] for i in range(len(ids)-seq_len)]
-    def __len__(self): return len(self.data)
-    def __getitem__(self, idx):
-        seq = torch.tensor(self.data[idx], dtype=torch.long)
-        return seq[:-1], seq[1:]
+        if not sents:
+            sents = [p.strip() for p in corpus.split("\n\n") if p.strip()]
 
-# ================================
-# TRANSFORMER MODEL
-# ================================
-class PosEnc(nn.Module):
-    def __init__(self, d_model, max_len=4096):
+        if not sents:
+            raise ValueError("No valid text found in documents.")
+
+        vecs = np.vstack([self._embed(s) for s in sents])
+        self.dim = vecs.shape[1]
+
+        if faiss:
+            faiss.normalize_L2(vecs)
+            idx = faiss.IndexFlatIP(self.dim)
+            idx.add(vecs)
+            self.index = idx
+        else:
+            self.vecs = vecs
+
+        self.sentences = sents
+        return len(sents)
+
+    def search(self, query, top_k=8):
+        qv = self._embed(query).reshape(1, -1)
+
+        if faiss and self.index:
+            faiss.normalize_L2(qv)
+            k = min(top_k, len(self.sentences))
+            D, I = self.index.search(qv, k)
+            return [(self.sentences[i], float(s)) for s, i in zip(D[0], I[0])]
+
+        # brute force
+        vecs = self.vecs
+        qn = qv / (np.linalg.norm(qv) + 1e-8)
+        mn = vecs / (np.linalg.norm(vecs, axis=1, keepdims=True) + 1e-8)
+        scores = (mn @ qn.T).ravel()
+        idx = np.argsort(-scores)[:8]
+        return [(self.sentences[i], float(scores[i])) for i in idx]
+
+##############################################################
+# KEYWORD MATCHING
+##############################################################
+def extract_keywords(query, nlp):
+    doc = nlp(query)
+    keys = set()
+    for t in doc:
+        if t.pos_ in ("NOUN", "PROPN", "VERB") and not t.is_stop:
+            keys.add(t.lemma_.lower())
+    for ent in doc.ents:
+        keys.add(ent.text.lower())
+    return list(keys)
+
+def keyword_score(keys, sent, nlp):
+    if not keys:
+        return 0.0
+    doc = nlp(sent)
+    lemmas = {t.lemma_.lower() for t in doc}
+    s = sent.lower()
+    score = 0.0
+    for k in keys:
+        if k in lemmas:
+            score += 1.0
+        elif k in s:
+            score += 0.8
+    return score / max(1, len(keys))
+
+##############################################################
+# PRIMARY BEST SENTENCE
+##############################################################
+def choose_primary(query, cands, nlp):
+    keys = extract_keywords(query, nlp)
+    best_sent = None
+    best_score = -1e9
+    best_sem = 0
+    best_kw = 0
+    for sent, sem in cands:
+        kw = keyword_score(keys, sent, nlp)
+        combined = 0.7 * sem + 0.3 * kw
+        if combined > best_score:
+            best_score = combined
+            best_sent = sent
+            best_sem = sem
+            best_kw = kw
+    return best_sent, best_sem, best_kw
+
+##############################################################
+# SEMANTIC GATING
+##############################################################
+def cos_sim(a, b):
+    a = a / (np.linalg.norm(a) + 1e-8)
+    b = b / (np.linalg.norm(b) + 1e-8)
+    return float(np.dot(a, b))
+
+SEM_THRESHOLD = 0.18
+
+def sem_gate(query, sentence, rag):
+    q = rag._embed(query)
+    s = rag._embed(sentence)
+    sim = cos_sim(q, s)
+    return sim >= SEM_THRESHOLD, sim
+
+##############################################################
+# FALLBACK TRANSFORMER (restricted)
+##############################################################
+class TinyCrossEncoder(nn.Module):
+    def __init__(self, vocab=30000, hidden=128, heads=4, layers=2, max_len=128):
         super().__init__()
-        pe = torch.zeros(max_len, d_model)
-        pos = torch.arange(max_len).unsqueeze(1).float()
-        div = torch.exp(torch.arange(0, d_model, 2).float() * (-math.log(10000.0)/d_model))
-        pe[:, 0::2] = torch.sin(pos*div)
-        pe[:, 1::2] = torch.cos(pos*div)
-        self.register_buffer("pe", pe.unsqueeze(0))
-    def forward(self, x): return x + self.pe[:, :x.size(1)]
+        self.max_len = max_len
+        self.emb = nn.Embedding(vocab, hidden)
+        enc = nn.TransformerEncoderLayer(
+            d_model=hidden,
+            nhead=heads,
+            dim_feedforward=hidden * 4,
+            activation="gelu",
+            batch_first=True
+        )
+        self.enc = nn.TransformerEncoder(enc, num_layers=layers)
+        self.cls = nn.Linear(hidden, 1)
 
-class TinyEncLM(nn.Module):
-    def __init__(self, vocab_size, d=256, heads=8, layers=6, ff=512):
-        super().__init__()
-        self.vocab = vocab_size
-        self.d = d
-        self.emb = nn.Embedding(vocab_size, d)
-        self.pos = PosEnc(d)
-        layer = nn.TransformerEncoderLayer(d_model=d, nhead=heads, dim_feedforward=ff, dropout=0.1, batch_first=True)
-        self.enc = nn.TransformerEncoder(layer, layers)
-        self.fc = nn.Linear(d, vocab_size)
-    def mask(self, n, device):
-        m = torch.triu(torch.ones(n, n, device=device), 1)
-        return m.masked_fill(m == 1, float("-inf"))
-    def forward(self, x):
-        x = self.emb(x)*math.sqrt(self.d)
-        x = self.pos(x)
-        mask = self.mask(x.size(1), x.device)
-        h = self.enc(x, mask=mask)
-        return self.fc(h)
-    @torch.no_grad()
-    def encode(self, x):
-        x = self.emb(x)*math.sqrt(self.d)
-        x = self.pos(x)
-        mask = self.mask(x.size(1), x.device)
-        h = self.enc(x, mask=mask)
-        return h.mean(dim=1)
+    def forward(self, ids):
+        x = self.emb(ids)
+        x = self.enc(x)
+        return self.cls(x[:, 0, :]).squeeze(-1)
 
-# ================================
-# TRAINING (Mini-Batch)
-# ================================
-def train_lm(model, dataset, epochs=3):
-    dev = "cuda" if torch.cuda.is_available() else "cpu"
-    model.to(dev)
-    loader = DataLoader(dataset, batch_size=16, shuffle=True)
-    opt = torch.optim.AdamW(model.parameters(), lr=1e-3)
-    loss_fn = nn.CrossEntropyLoss()
-    model.train()
-    for ep in range(epochs):
-        total = 0.0
-        for x, y in loader:
-            x, y = x.to(dev), y.to(dev)
-            opt.zero_grad()
-            logits = model(x)
-            loss = loss_fn(logits.reshape(-1, model.vocab), y.reshape(-1))
-            loss.backward()
-            opt.step()
-            total += loss.item()
-        print(f"Epoch {ep+1}/{epochs} - Loss {total/len(loader):.4f}")
+class SimpleTokenizer:
+    def __init__(self, max_len=128):
+        self.max_len = max_len
+        self.vocab = {"[PAD]": 0, "[UNK]": 1}
+        self.next_id = 2
 
-# ================================
-# TOPIC SPOTTING
-# ================================
-nlp = spacy.load("en_core_web_sm")
-def extract_topics(text):
-    doc = nlp(text)
-    return [ent.text for ent in doc.ents if ent.label_ in ["ORG", "PERSON", "SKILL", "PROJECT"]]
+    def encode(self, text):
+        toks = []
+        for w in text.lower().split():
+            if w not in self.vocab:
+                self.vocab[w] = self.next_id
+                self.next_id += 1
+            toks.append(self.vocab[w])
+        toks = toks[: self.max_len - 1]
+        toks = [0] + toks
+        toks += [0] * (self.max_len - len(toks))
+        return torch.tensor(toks, dtype=torch.long).unsqueeze(0)
 
-# ================================
-# FAISS INDEX
-# ================================
-def build_faiss_index(embs):
-    dim = embs.shape[1]
-    index = faiss.IndexFlatIP(dim)
-    index.add(embs.numpy())
-    return index
+@st.cache_resource
+def load_ce():
+    tok = SimpleTokenizer()
+    model = TinyCrossEncoder().to(device)
+    model.eval()
+    return tok, model
 
-def search_faiss(index, q_emb, topk=5):
-    D, I = index.search(q_emb.numpy().reshape(1, -1), topk)
-    return I[0], D[0]
+tok_ce, ce_model = load_ce()
 
-# ================================
-# RERANKING + ANSWER EXTRACTION
-# ================================
-def lexical_overlap_score(question, chunk):
-    table = str.maketrans("", "", string.punctuation)
-    q_toks = [w.lower().translate(table) for w in question.split() if w.strip()]
-    c_toks = [w.lower().translate(table) for w in chunk.split() if w.strip()]
-    q_set, c_set = set(q_toks), set(c_toks)
-    if not q_set or not c_set: return 0.0
-    return len(q_set & c_set) / len(q_set | c_set)
+def fallback_transformer(query, candidates, rag):
+    valid = []
+    for sent, sem in candidates:
+        ok, _ = sem_gate(query, sent, rag)
+        if ok:
+            valid.append((sent, sem))
+    if not valid:
+        return None
 
-def rerank_candidates(question, candidates):
-    reranked = []
-    for chunk, base_score in candidates:
-        lex_score = lexical_overlap_score(question, chunk)
-        final_score = 0.75 * base_score + 0.25 * lex_score
-        reranked.append((chunk, final_score))
-    reranked.sort(key=lambda x: x[1], reverse=True)
-    return reranked[:3]
+    best = None
+    best_score = -1e9
 
-def extract_answer(question, chunks):
-    table = str.maketrans("", "", string.punctuation)
-    q_toks = set(w.lower().translate(table) for w in question.split() if len(w.strip()) > 2)
-    snippets = []
-    for chunk, _ in chunks:
-        sentences = chunk.split(".")
-        for sent in sentences:
-            s = sent.strip()
-            if not s: continue
-            s_tokens = set(w.lower().translate(table) for w in s.split() if w.strip())
-            if q_toks & s_tokens:
-                snippets.append(s)
-    return " ".join(snippets[:3]) if snippets else chunks[0][0]
+    for sent, sem in valid:
+        ids = tok_ce.encode(f"[Q]{query}[S]{sent}").to(device)
+        with torch.no_grad():
+            ce = ce_model(ids).item()
+        ce_norm = float(torch.tanh(torch.tensor(ce)))
+        score = 0.6 * sem + 0.4 * ce_norm
+        if score > best_score:
+            best_score = score
+            best = sent
+    return best
 
-# ================================
-# LANGGRAPH ORCHESTRATION
-# ================================
-def chunk_documents(texts):
-    chunks = []
-    for d in texts:
-        toks = d.split()
-        for i in range(0, len(toks), 80):
-            chunk = " ".join(toks[i:i+80])
-            if chunk.strip():
-                chunks.append(chunk)
-    return chunks
-
-def train_mini_batches(all_ids, token2id):
-    model = TinyEncLM(vocab_size=len(token2id))
-    batch_size = 500
-    for i in range(0, len(all_ids), batch_size):
-        batch_ids = all_ids[i:i+batch_size]
-        dataset = LMData(batch_ids, seq_len=64)
-        if len(dataset) > 5:
-            train_lm(model, dataset, epochs=3)
-    return model
-
-def embed_chunks(model, chunks, token2id):
-    embs = []
-    for i in range(0, len(chunks), 16):
-        batch = chunks[i:i+16]
-        ids_list = [encode(t, token2id) for t in batch]
-        max_len = max(len(x) for x in ids_list)
-        padded = [x+[SPECIAL["PAD"]]*(max_len-len(x)) for x in ids_list]
-        x = torch.tensor(padded, dtype=torch.long)
-        e = model.encode(x)
-        embs.append(e.cpu())
-    return torch.cat(embs, dim=0)
-
-# ================================
+##############################################################
 # STREAMLIT UI
-# ================================
-st.title("🚀 Enterprise Mobility RAG Assistant")
+##############################################################
+st.title("📘 Semantic-Gated RAG (TXT + PDF Offline Chatbot)")
 
-uploads = st.file_uploader("Upload documents", type=["txt", "pdf", "docx"], accept_multiple_files=True)
+if nlp is None:
+    st.error("Install spaCy model: python -m spacy download en_core_web_sm")
 
-if st.button("Build Index"):
-    if not uploads:
+if "rag" not in st.session_state:
+    st.session_state.rag = None
+if "history" not in st.session_state:
+    st.session_state.history = []
+
+##############################################################
+# UPLOAD TXT and PDF
+##############################################################
+import pdfplumber
+
+st.subheader("📂 Upload Documents (.txt or .pdf)")
+
+files = st.file_uploader(
+    "Choose files",
+    type=["txt", "pdf"],
+    accept_multiple_files=True
+)
+
+corpus = ""
+
+if files:
+    for f in files:
+        name = f.name.lower()
+        if name.endswith(".txt"):
+            try:
+                corpus += f.read().decode("utf-8", "ignore") + "\n"
+            except:
+                corpus += f.read().decode("latin-1", "ignore") + "\n"
+
+        elif name.endswith(".pdf"):
+            try:
+                with pdfplumber.open(f) as pdf:
+                    for p in pdf.pages:
+                        text = p.extract_text() or ""
+                        corpus += text + "\n"
+            except Exception as e:
+                st.error(f"PDF error {f.name}: {e}")
+
+    if corpus.strip():
+        st.success("Documents loaded. Click Build Index.")
+    else:
+        st.error("No extractable text found.")
+
+##############################################################
+# BUILD INDEX
+##############################################################
+if st.button("🔧 Build Index"):
+    if not corpus.strip():
         st.error("Upload documents first.")
     else:
-        doc_texts = [load_text(f) for f in uploads if load_text(f).strip()]
-        system_ctx = get_desktop_context()
-        all_texts = doc_texts + [system_ctx]
-        token2id, id2token = build_vocab(all_texts)
-        all_ids = []
-        for t in all_texts: all_ids.extend(encode(t, token2id))
+        rag = ExtractiveRAG(nlp)
+        with st.spinner("Indexing..."):
+            n = rag.build(corpus)
+        st.session_state.rag = rag
+        st.success(f"Indexed {n} sentences!")
 
-        # LangGraph pipeline
-        graph = Graph()
-        graph.add_node("chunking", lambda: chunk_documents(doc_texts))
-        graph.add_node("train", lambda: train_mini_batches(all_ids, token2id))
-        graph.add_node("embedding", None)
-        graph.add_node("faiss", None)
+##############################################################
+# CHAT
+##############################################################
+st.subheader("💬 Ask a question")
 
-        chunks = chunk_documents(doc_texts)
-        model = train_mini_batches(all_ids, token2id)
-        chunk_embs = embed_chunks(model, chunks, token2id)
-        index = build_faiss_index(chunk_embs)
+for r, t in st.session_state.history:
+    st.chat_message(r).write(t)
 
-        st.session_state.model = model
-        st.session_state.token2id = token2id
-        st.session_state.chunks = chunks
-        st.session_state.chunk_embs = chunk_embs
-        st.session_state.faiss_index = index
-        st.success(f"Indexed {len(chunks)} chunks.")
+q = st.chat_input("Ask something...")
 
-query = st.text_input("Ask a question:")
-if st.button("Search"):
-    if st.session_state.faiss_index is None:
-        st.error("Index not ready.")
+if q:
+    st.session_state.history.append(("user", q))
+    st.chat_message("user").write(q)
+
+    if st.session_state.rag is None:
+        ans = "Please build the index first."
     else:
-        q_ids = encode(query, st.session_state.token2id)
-        q_tensor = torch.tensor([q_ids], dtype=torch.long)
-        q_emb = st.session_state.model.encode(q_tensor)
-        idxs, scores = search_faiss(st.session_state.faiss_index, q_emb)
-        candidates = [(st.session_state.chunks[i], float(scores[j])) for j, i in enumerate(idxs)]
-        reranked = rerank_candidates(query, candidates)
-        answer = extract_answer(query, reranked)
-        st.write("### Answer:")
-        st.write(answer)
-        st.write("### Top Chunks:")
-        for chunk, score in reranked:
-            st.write(f"Score: {score:.4f}")
-            st.write(chunk)
+        rag = st.session_state.rag
+        cands = rag.search(q, top_k=8)
+
+        # PRIMARY
+        ps, p_sem, p_kw = choose_primary(q, cands, nlp)
+        ps_ok, ps_sim = sem_gate(q, ps, rag)
+
+        if ps_ok:
+            ans = ps
+        else:
+            fb = fallback_transformer(q, cands, rag)
+            if fb:
+                fb_ok, fb_sim = sem_gate(q, fb, rag)
+                if fb_ok and fb_sim >= ps_sim:
+                    ans = fb
+                else:
+                    ans = ps
+            else:
+                ans = ps
+
+    st.chat_message("assistant").write(ans)
+    st.session_state.history.append(("assistant", ans))
