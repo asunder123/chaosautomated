@@ -1,43 +1,62 @@
-Here’s a **README.md** for your project that explains the concept, features, setup, and usage of your **Offline Semantically-Gated RAG (FAISS + Transformer Failover)** chatbot:
+Here’s a **README.md** tailored for your updated **Offline Semantic-Gated RAG v2.1** system, based on the architecture and features you described:
 
 ***
 
-# 📘 Offline Semantically-Gated RAG Chatbot
+# 🤖 Offline Semantic-Gated RAG v2.1 (TXT + PDF)
 
 ## Overview
 
-This project implements an **offline Retrieval-Augmented Generation (RAG)** chatbot with **semantic gating** and **transformer-based failover**. It is designed for environments where **internet access is restricted**, yet users need intelligent document-aware Q\&A capabilities.
+This project implements an **offline Retrieval-Augmented Generation (RAG)** chatbot with advanced **semantic gating**, **context anchoring**, and **transformer-based failover**. It is designed for environments where **internet access is restricted**, yet users need intelligent, document-aware Q\&A capabilities.
 
-### ✅ Key Features
+***
 
-*   **Document Ingestion**: Supports `.txt` and `.pdf` files.
-*   **Semantic Search**:
-    *   Uses **spaCy embeddings** for sentence-level semantic similarity.
-    *   FAISS-based vector index for fast retrieval (falls back to brute force if FAISS is unavailable).
-*   **Keyword-Aware Ranking**:
-    *   Combines semantic similarity with keyword relevance for better precision.
+## ✅ Key Features
+
+*   **Document Ingestion**:
+    *   Supports `.txt` and `.pdf` files.
+    *   Extracts text using `pdfplumber` for PDFs.
+*   **Sliding-Window Chunking**:
+    *   Single sentences, 2-sentence, and 3-sentence windows for richer context.
+*   **Sentence Quality Scoring**:
+    *   Penalizes boilerplate, headers, and very short/long sentences.
+*   **Context Anchoring**:
+    *   Strong alignment using nouns, verbs, noun chunks, and named entities.
+*   **Dependency Alignment**:
+    *   Matches subject–verb–object structure between query and candidate answers.
 *   **Semantic Gating**:
-    *   Ensures retrieved answers meet a minimum semantic similarity threshold.
+    *   Ensures answers meet a minimum semantic similarity and anchor requirement.
 *   **Transformer Failover**:
-    *   If semantic gating fails, a lightweight **cross-encoder transformer** re-ranks candidates.
+    *   Tiny cross-encoder reranks candidates when semantic gating fails.
+*   **Anti-Collapse Memory**:
+    *   Avoids repeating the same incorrect answer across unrelated queries.
 *   **Offline Operation**:
-    *   No external API calls; works entirely on local resources.
+    *   Entire pipeline runs locally (spaCy + FAISS + PyTorch).
 *   **Streamlit UI**:
     *   Upload documents, build index, and chat interactively.
 
 ***
 
-## Architecture
+## Architecture Diagram
 
-    [TXT/PDF Upload] → [Text Extraction] → [Sentence Segmentation] → [spaCy Embeddings]
+architecture.png
+
+**Pipeline:**
+
+    [Upload TXT/PDF] → [Text Extraction] → [Sliding Window Chunking]
            ↓
-       [FAISS Index] ←→ [Semantic Search] ←→ [Keyword Scoring]
+    [spaCy Embeddings + Quality Scoring] → [FAISS Index]
            ↓
-       [Semantic Gate] → [Primary Answer]
+    [Query Embedding + Keyword Extraction]
            ↓
-       [Transformer Failover] (if needed)
+    [Candidate Retrieval (Semantic + Keyword)]
            ↓
-       [Final Answer Display]
+    [Semantic Gating + Context Anchoring]
+           ↓
+    [Tiny Transformer Failover (Cross-Encoder)]
+           ↓
+    [Answer Selection + Anti-Collapse Memory]
+           ↓
+    [Streamlit Chat UI]
 
 ***
 
@@ -61,16 +80,16 @@ python -m spacy download en_core_web_sm
 
 1.  **Upload Documents**:
     *   Upload `.txt` or `.pdf` files via the Streamlit interface.
-    *   Text is extracted and segmented into sentences.
+    *   Text is extracted and segmented into sentences and sliding windows.
 2.  **Build Index**:
     *   Sentences are embedded using spaCy vectors.
     *   FAISS index is built for fast similarity search.
 3.  **Ask Questions**:
-    *   Query is embedded and compared against indexed sentences.
-    *   Semantic + keyword scores determine the best candidate.
-    *   If semantic similarity is below threshold, fallback transformer re-ranks candidates.
+    *   Query is embedded and compared against indexed chunks.
+    *   Semantic + keyword + dependency scores determine the best candidate.
+    *   If semantic gating fails, fallback transformer reranks candidates.
 4.  **Answer Display**:
-    *   The best sentence is shown as the answer in the chat interface.
+    *   The best candidate is shown in the chat interface.
 
 ***
 
@@ -94,7 +113,7 @@ streamlit run app.py
 ## Configuration
 
 *   **Semantic Threshold**: `SEM_THRESHOLD = 0.18` (adjust for stricter or looser gating).
-*   **Top-K Retrieval**: Default `top_k=8`.
+*   **Top-K Retrieval**: Default `top_k=12`.
 *   **Transformer Failover**:
     *   Lightweight cross-encoder with 2 layers, 128 hidden size.
     *   Dynamically builds vocabulary during runtime.
@@ -103,13 +122,30 @@ streamlit run app.py
 
 ## Why Is This Approach Novel?
 
-*   **Semantic Gating**:
-    *   Unlike standard RAG, this system enforces a semantic similarity threshold before accepting an answer.
+*   **Semantic Gating with Anchors**:
+    *   Unlike standard RAG, this system enforces semantic similarity AND context anchor checks before accepting an answer.
 *   **Hybrid Ranking**:
-    *   Combines semantic embeddings with keyword-based scoring for improved relevance.
+    *   Combines semantic similarity, keyword relevance, dependency alignment, and sentence quality.
 *   **Failover Mechanism**:
     *   Introduces a secondary transformer-based cross-encoder for re-ranking when semantic gating fails.
+*   **Anti-Collapse Memory**:
+    *   Prevents repetitive incorrect answers across unrelated queries.
 *   **Offline-First Design**:
     *   Entire pipeline runs locally without external APIs, making it suitable for air-gapped or secure environments.
+
+***
+
+## Future Enhancements
+
+*   Add **BM25 keyword search** for hybrid retrieval.
+*   Support **multi-turn conversation memory**.
+*   Integrate **larger transformer models** for better failover performance.
+*   Extend to **domain-specific embeddings** (e.g., SciSpaCy for scientific text).
+
+***
+
+## License
+
+MIT License
 
 ***
