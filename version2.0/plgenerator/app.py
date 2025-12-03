@@ -1,132 +1,132 @@
 import streamlit as st
 from e79_codegen import transpile_to_e79
-from e79_interpreter import run_e79
-import base64
+from e79_interpreter import compile_e79, run_e79_function
 
 
-# ------------------------------------------------------
-# Utility: download link
-# ------------------------------------------------------
-def make_download(label, filename, text):
-    b64 = base64.b64encode(text.encode()).decode()
-    st.markdown(
-        f'<a download="{filename}" href="data:text/plain;base64,{b64}">{label}</a>',
-        unsafe_allow_html=True
-    )
+st.set_page_config(page_title="E79 Rule Engine IDE", layout="wide")
+st.title("⚡ E79 Rule Engine IDE — Python → E79 → AST-compiled Rules")
 
 
-# ------------------------------------------------------
-# Codegen: E79 → C (stub)
-# ------------------------------------------------------
-def e79_to_c(src: str):
-    out = ["#include <stdio.h>", ""]
-    for line in src.splitlines():
-        s = line.strip()
-        if s.startswith("fn "):
-            name = s[3:].split("(")[0].strip()
-            out.append(f"double {name}() {{")
-        elif s.startswith("return"):
-            val = s.replace("return", "").strip()
-            out.append(f"    return {val};\n}}")
-        elif "=" in s:
-            v, e = s.split("=", 1)
-            out.append(f"    double {v.strip()} = {e.strip()};")
-    return "\n".join(out)
-
-
-# ------------------------------------------------------
-# Codegen: E79 → LLVM pseudo IR
-# ------------------------------------------------------
-def e79_to_llvm(src: str):
-    out = ["; PSEUDO LLVM IR", ""]
-    for line in src.splitlines():
-        s = line.strip()
-        if "=" in s:
-            left, right = s.split("=", 1)
-            out.append(f"%{left.strip()} = add double {right.strip()}")
-        if s.startswith("return"):
-            val = s.replace("return", "").strip()
-            out.append(f"ret double {val}")
-    return "\n".join(out)
-
-
-# ------------------------------------------------------
-# Streamlit UI
-# ------------------------------------------------------
-st.set_page_config(page_title="E79 IDE", layout="wide")
-st.title("⚡ E79 Language IDE — Python → E79 → Run → C → LLVM")
-
-tabs = st.tabs(
-    ["Python → E79", "E79 Editor", "Run E79", "Downloads", "C & LLVM Output"]
+tab1, tab2, tab3 = st.tabs(
+    ["Python → E79 (Rules)", "E79 Editor", "Compile & Run Rule"]
 )
 
-# ---------------- TAB 1 ----------------
-with tabs[0]:
-    st.header("Transpile Python → E79")
+# ======================================================
+# TAB 1 — Python → E79 (Rules)
+# ======================================================
+with tab1:
+    st.header("Define Rules as Python Functions")
 
-    py = st.text_area(
-        "Python code:",
-        """def test(a, b):
-    c = a + b
-    return c
-""",
-        height=200,
+    default_py = """def risk_rule(score, exposure):
+    high = score > 0.8 and exposure > 1_000_000
+    med = score > 0.5 and exposure > 500_000
+    label = "LOW"
+    label = "MEDIUM" if med else label
+    label = "HIGH" if high else label
+    return label
+"""
+
+    py_code = st.text_area(
+        "Python rule function(s):",
+        st.session_state.get("py_rules", default_py),
+        height=260,
     )
+    st.session_state["py_rules"] = py_code
 
-    if st.button("Convert to E79"):
+    if st.button("Transpile to E79"):
         try:
-            e79 = transpile_to_e79(py)
-            st.session_state["e79"] = e79
-            st.code(e79)
+            e79_code = transpile_to_e79(py_code)
+            st.session_state["e79"] = e79_code
+            st.session_state["compiled_rules"] = None
+            st.success("Transpiled to E79:")
+            st.code(e79_code, language="text")
         except Exception as e:
-            st.error(e)
+            st.error(f"Transpilation error: {e}")
 
-# ---------------- TAB 2 ----------------
-with tabs[1]:
-    st.header("Edit E79 Code")
-    code = st.session_state.get(
+# ======================================================
+# TAB 2 — E79 Editor
+# ======================================================
+with tab2:
+    st.header("Edit E79 Rule Code")
+
+    default_e79 = st.session_state.get(
         "e79",
-        "fn test(a: auto, b: auto) -> auto:\n    c = a + b\n    return c\n",
-    )
-    st.session_state["e79"] = st.text_area("E79 Code:", code, height=300)
-
-# ---------------- TAB 3 ----------------
-with tabs[2]:
-    st.header("Run E79 (like Python)")
-
-    code_to_run = st.text_area(
-        "E79 code to execute:",
-        st.session_state.get("e79", ""),
-        height=240,
+        """fn risk_rule(score: auto, exposure: auto) -> auto:
+    high = score > 0.8 and exposure > 1000000
+    med = score > 0.5 and exposure > 500000
+    label = "LOW"
+    label = "MEDIUM" if med else label
+    label = "HIGH" if high else label
+    return label
+""",
     )
 
-    fn = st.text_input("Function:", "test")
-    args = st.text_input("Arguments:", "2, 3")
+    e79_code = st.text_area(
+        "E79 Code:",
+        default_e79,
+        height=300,
+        key="e79_editor",
+    )
+    st.session_state["e79"] = e79_code
 
-    if st.button("Run E79 Code"):
-        try:
-            parsed = [] if not args.strip() else [eval(x) for x in args.split(",")]
-            result = run_e79(code_to_run, call=fn, args=parsed)
-            st.success(f"Output = {result}")
-        except Exception as e:
-            st.error(e)
+# ======================================================
+# TAB 3 — Compile & Run Rule
+# ======================================================
+with tab3:
+    st.header("Compile E79 Rules and Run on a Context")
 
-# ---------------- TAB 4 ----------------
-with tabs[3]:
-    st.header("Download generated stubs")
+    e79_src = st.session_state.get("e79", "")
+    if not e79_src.strip():
+        st.info("No E79 code available yet. Use the first tab to generate it.")
+    else:
+        if st.button("Compile E79 Rules"):
+            try:
+                compiled = compile_e79(e79_src)
+                st.session_state["compiled_rules"] = compiled
+                st.success(
+                    "Rules compiled. Available functions: "
+                    + ", ".join(compiled.keys())
+                )
+            except Exception as e:
+                st.error(f"Compile error: {e}")
 
-    e79 = st.session_state.get("e79", "")
-    c_code = e79_to_c(e79)
-    ll = e79_to_llvm(e79)
+        compiled = st.session_state.get("compiled_rules")
 
-    make_download("Download E79 file", "program.e79", e79)
-    make_download("Download C stub", "program.c", c_code)
-    make_download("Download LLVM IR", "program.ll", ll)
+        rule_name = st.text_input("Rule / function name to run:", "risk_rule")
 
-# ---------------- TAB 5 ----------------
-with tabs[4]:
-    st.header("C Stub Output")
-    st.code(e79_to_c(st.session_state.get("e79", "")))
+        ctx_default = "score=0.9, exposure=2000000"
+        ctx_str = st.text_input(
+            "Context (key=value, comma separated):",
+            ctx_default,
+        )
 
-    st.header("LLVM IR Output")
-    st.code(e79_to_llvm(st.session_state.get("e79", "")))
+        if st.button("Run Rule"):
+            if compiled is None:
+                # try compiling on the fly
+                try:
+                    compiled = compile_e79(e79_src)
+                    st.session_state["compiled_rules"] = compiled
+                except Exception as e:
+                    st.error(f"Compile error: {e}")
+                    compiled = None
+
+            if compiled is not None:
+                try:
+                    context = {}
+                    if ctx_str.strip():
+                        parts = ctx_str.split(",")
+                        for p in parts:
+                            if "=" not in p:
+                                continue
+                            k, v = p.split("=", 1)
+                            key = k.strip()
+                            val_str = v.strip()
+                            # interpret values as Python literals
+                            val = eval(val_str)
+                            context[key] = val
+
+                    result = run_e79_function(compiled, rule_name, **context)
+                    st.success(f"Rule result: {result}")
+
+                except Exception as e:
+                    st.error(f"Runtime error: {e}")
