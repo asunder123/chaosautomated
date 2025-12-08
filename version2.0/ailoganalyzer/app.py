@@ -201,24 +201,35 @@ class AdaptiveHierarchicalTransformer(nn.Module):
         return pooled, weights. squeeze(0)
 
 
-MODEL_PATH = "adaptive_transformer. pt"
+
+# ======================================================
+# MODEL LOADING, SAVING & SESSION CACHE
+# ======================================================
+
+MODEL_PATH = "adaptive_transformer.pt"
 
 @st.cache_resource
 def get_model(device: torch.device):
+    """Load model from disk if available, else create and save a new one."""
     model = AdaptiveHierarchicalTransformer()
     if os.path.exists(MODEL_PATH):
-        with contextlib.suppress(Exception):
+        try:
             sd = torch.load(MODEL_PATH, map_location=device)
             model.load_state_dict(sd)
             st.info("✅ Loaded model from disk.")
+        except Exception as e:
+            st.warning(f"⚠️ Failed to load saved model: {e}. Using fresh instance.")
+    else:
+        st.warning("⚠️ No saved model found. Creating new instance and saving.")
+        torch.save(model.state_dict(), MODEL_PATH)
+
+    # Optional compile for speed
     with contextlib.suppress(Exception):
         model = torch.compile(model)
-    model.eval()
-    model.to(device)
-    if not os.path.exists(MODEL_PATH):
-        with contextlib.suppress(Exception):
-            torch.save(model.state_dict(), MODEL_PATH)
+
+    model.eval().to(device)
     return model
+
 
 
 # ======================================================
@@ -713,66 +724,86 @@ def likely_next_activity(df_ts: pd.DataFrame) -> Optional[str]:
     return sorted(candidates, key=lambda x: x[1], reverse=True)[0][0]
 
 
-def predictive_summary_enhanced(vol, anom_ts, sev_ts, acts_ts, df_ts, chunk_stats_list, 
+
+
+def predictive_summary_enhanced(vol, anom_ts, sev_ts, acts_ts, df_ts, chunk_stats_list,
                                edges_rank, ts_freq: str, anom_forecast: List[float],
-                               act_predictions: List[Tuple[str, float]], 
+                               act_predictions: List[Tuple[str, float]],
                                causal_chains: List[List[int]]) -> str:
-    """Enhanced predictive summary with forecasts, chains, and warnings."""
+    """
+    Generate predictive summary with context-aware checks:
+    - Skip misleading insights when data is sparse
+    - Include anomaly trend, forecast, activity predictions, causal chains, severity, and warnings
+    """
     lines = []
-    
-    # Anomaly trend + forecast
-    risk_line = "Risk trend: unavailable"
-    if not anom_ts.empty:
-        s = anom_ts["anomaly_mean"].ewm(span=3). mean()
-        if len(s) >= 2:
-            slope = float(s.iloc[-1] - s.iloc[-2])
-            level = float(s.iloc[-1])
-            trend = "rising" if slope > 0.0 else "falling" if slope < 0.0 else "steady"
-            risk_line = f"Anomaly EWMA is **{trend}** (now={level:.3f}, Δ={slope:+.3f}) over **{ts_freq}** bins."
-            
-            if anom_forecast:
-                avg_forecast = np.mean(anom_forecast)
-                risk_line += f" **Forecast**: next {len(anom_forecast)} steps avg={avg_forecast:.3f}."
-    
+
+    # --- Anomaly Trend + Forecast ---
+    if anom_ts.empty or "anomaly_mean" not in anom_ts or len(anom_ts) < 3:
+        risk_line = "No meaningful anomaly trend detected (insufficient data)."
+    else:
+        s = anom_ts["anomaly_mean"].ewm(span=3).mean()
+        slope = float(s.iloc[-1] - s.iloc[-2])
+        level = float(s.iloc[-1])
+        trend = "rising" if slope > 0 else "falling" if slope < 0 else "steady"
+        risk_line = f"Anomaly EWMA is **{trend}** (now={level:.3f}, Δ={slope:+.3f}) over **{ts_freq}** bins."
+        if anom_forecast and len(anom_forecast) >= 1:
+            avg_forecast = np.mean(anom_forecast)
+            risk_line += f" **Forecast**: next {len(anom_forecast)} steps avg={avg_forecast:.3f}."
     lines.append(f"• {risk_line}")
-    
-    # Activity predictions
-    if act_predictions:
-        next_acts = ", ".join([f"{a. replace('_', ' ').title()} ({p:.1%})" for a, p in act_predictions[:3]])
+
+    # --- Activity Predictions ---
+    unique_acts = set(df_ts["activity"].dropna())
+    if act_predictions and len(unique_acts) > 1:
+        next_acts = ", ".join([f"{a.replace('_', ' ').title()} ({p:.1%})" for a, p in act_predictions[:3]])
         lines.append(f"• Next likely activities: {next_acts}.")
-    
-    # Causal chains (root cause path)
+    else:
+        lines.append("• Activity prediction skipped (insufficient diversity).")
+
+    # --- Causal Chains ---
     if causal_chains:
         top_chain = causal_chains[0]
         chain_desc = " → ".join([f"C{c+1}" for c in top_chain])
         lines.append(f"• Primary causal chain: {chain_desc}.")
-    
-    # Severity in latest chunks
+    else:
+        lines.append("• No causal chain detected.")
+
+    # --- Severity in Latest Chunks ---
     if chunk_stats_list:
         last_k = chunk_stats_list[-min(3, len(chunk_stats_list)):]
         err_w = sum(cs.severity_counts.get("ERROR", 0) for cs in last_k)
         warn_w = sum(cs.severity_counts.get("WARN", 0) for cs in last_k)
         lines.append(f"• Latest {len(last_k)} chunk(s): ERROR={err_w}, WARN={warn_w}.")
-    
-    # Top causal edges
+    else:
+        lines.append("• No severity data available.")
+
+    # --- Top Causal Edges ---
     if edges_rank:
         top_edges = sorted(edges_rank, key=lambda x: x["score"], reverse=True)[:3]
         desc = "; ".join([f"C{e['from_chunk']}→C{e['to_chunk']} (score {e['score']:.2f})" for e in top_edges])
         lines.append(f"• Most influential causes: {desc}.")
-    
-    # Error drivers
+    else:
+        lines.append("• No causal edges above threshold.")
+
+    # --- Error Drivers ---
     exc_all = Counter()
     for cs in chunk_stats_list:
         exc_all.update(cs.exceptions)
     if exc_all:
         e1 = ", ".join([f"{k}({v})" for k, v in exc_all.most_common(3)])
         lines.append(f"• Top exceptions: {e1}.")
-    
-    # Trend warnings
-    trend_warns = warn_on_trend(anom_ts, vol if not vol. empty else pd.Series())
-    if trend_warns:
-        lines.extend(trend_warns)
-    
+    else:
+        lines.append("• No exception patterns detected.")
+
+    # --- Trend Warnings ---
+    anomaly_series = anom_ts["anomaly_mean"] if "anomaly_mean" in anom_ts else pd.Series()
+    volume_series = vol["count"] if "count" in vol else pd.Series()
+    if len(anomaly_series) >= 3 and len(volume_series) >= 3:
+        trend_warns = warn_on_trend(anomaly_series, volume_series)
+        if trend_warns:
+            lines.extend(trend_warns)
+    else:
+        lines.append("• Trend warnings skipped (insufficient time-series data).")
+
     return "\n".join(lines)
 
 
@@ -811,6 +842,7 @@ def render_activity_summary(df_ts: pd.DataFrame, sev_ts: pd.DataFrame, acts_ts: 
 
 
 
+
 # ======================================================
 # PART 3 — STREAMLIT APP (UI + Upload widget + Optimizations)
 # ======================================================
@@ -818,9 +850,6 @@ def render_activity_summary(df_ts: pd.DataFrame, sev_ts: pd.DataFrame, acts_ts: 
 st.set_page_config(page_title="Semantic Activity Log Analyzer v33", layout="wide")
 st.title("🧠 Semantic Activity Log Analyzer — v33 (Optimized)")
 st.caption("Efficient RCA • Incident Clustering • Anomaly Forecasting • Activity Prediction • Causal Chains")
-
-
-
 
 # === Helper functions used by Part 3 (upload, encoding, batching, GPU mem, auto-tune) ===
 
@@ -916,7 +945,7 @@ def auto_choose_chunk_size(num_lines, min_c=20, max_c=500, target_chunks=(12, 40
 
 # --- Sidebar Controls ---
 with st.sidebar:
-    st.header("⚙️ Controls &amp; Settings")
+    st.header("⚙️ Controls & Settings")
 
     mode = st.radio(
         "Analysis Mode",
@@ -958,7 +987,7 @@ with st.sidebar:
     min_edge_score = st.slider("Min edge score", 0.0, 1.0, 0.05, step=0.01, help="Filter weak causal links.")
     min_edge_infl = st.slider("Min edge influence", 0.0, 0.50, 0.01, step=0.01)
     arrow_scale = st.slider("Arrow thickness", 1.0, 12.0, 6.0, step=0.5)
-    arrow_offset = st.slider("Arrow offset", 0.0, 0.20, 0.08, step=0.01)
+    arrow_offset = st.slider("Arrow offset", 0.0, 0.20, 0.08, step=0.01)  # reserved for future bezier offset
     edge_line_width = st.slider("Edge line width", 0.5, 6.0, 2.8, step=0.1)
     edge_opacity = st.slider("Edge opacity", 0.1, 1.0, 0.75, step=0.05)
 
@@ -1112,7 +1141,7 @@ if uploaded_file:
     ax_anom.plot(anomaly_x, anomaly_y, marker='o', linestyle='-', color='#d62728', markersize=3, alpha=0.7)
     ax_anom.set_xlabel("Log Line Index")
     ax_anom.set_ylabel("Anomaly Score")
-    ax_anom.set_title("🔴 Line-wise Anomaly Trend (full span)")
+    ax_anom.set_title("Line-wise Anomaly Trend (full span)")
     ax_anom.grid(True, alpha=0.3)
     anomaly_plot_ph.pyplot(fig_anom)
     plt.close(fig_anom)
@@ -1147,6 +1176,7 @@ if uploaded_file:
     edges_rank: List[dict] = []
     if len(chunk_embeds_acc) > 1:
         try:
+            # Build similarity and RCA graph
             chunk_np = np.stack([e.numpy() for e in chunk_embeds_acc])
             sim_matrix, norms_cache = cosine_corr_matrix(chunk_np)
 
@@ -1155,25 +1185,23 @@ if uploaded_file:
                 base_topk=3, sim_threshold=0.35, infl_threshold=0.02, max_lag=lag_max
             )
 
+            # Use stable layout; reuse last positions if available
             pos = compute_layout_stable(G, st.session_state.get("pos_cache"))
             st.session_state.pos_cache = pos
 
-            # Plotly RCA
-            if G.number_of_edges() > 0 and PLOTLY_AVAILABLE:
-                safe_nodes = [n for n in G.nodes() if n in pos]
-                xs = [pos[n][0] for n in safe_nodes]
-                ys = [pos[n][1] for n in safe_nodes]
-                xmin, xmax = (min(xs)-0.15, max(xs)+0.15) if xs else (-1, 1)
-                ymin, ymax = (min(ys)-0.15, max(ys)+0.15) if ys else (-1,  1)
-
-                an_min = float(min(node_anomaly) if node_anomaly else 0)
-                an_max = float(max(node_anomaly) if node_anomaly else 1)
+            # ---- Plotly rendering (preferred) ----
+            if PLOTLY_AVAILABLE and G.number_of_edges() > 0:
+                # Normalize anomalies for color scale
+                an_min = float(min(node_anomaly)) if node_anomaly else 0.0
+                an_max = float(max(node_anomaly)) if node_anomaly else 1.0
                 if an_max - an_min < 1e-8:
                     an_max = an_min + 1e-8
-                norm_color = lambda a: (a - an_min) / (an_max - an_min)
+
+                def norm(a: float) -> float:
+                    return (a - an_min) / (an_max - an_min)
 
                 # Nodes
-                node_x, node_y, node_text, node_colors = [], [], [], []
+                node_x, node_y, node_text, node_color, node_marker_size = [], [], [], [], []
                 for n in G.nodes():
                     if n not in pos:
                         continue
@@ -1181,58 +1209,144 @@ if uploaded_file:
                     node_x.append(x)
                     node_y.append(y)
                     node_text.append(node_labels[n])
-                    node_colors.append(norm_color(node_anomaly[n]))
+                    node_color.append(norm(float(node_anomaly[n])))
+                    node_marker_size.append(12 + float(node_anomaly[n]) * 20)
 
-                node_colors_hex = sample_colorscale('Reds', node_colors) if node_colors else ['red'] * len(node_x)
+                node_colors_hex = sample_colorscale('Reds', node_color) if node_color else ['#d62728'] * len(node_x)
                 node_trace = go.Scatter(
                     x=node_x, y=node_y, mode='markers+text',
                     text=node_text, textposition='top center',
-                    marker=dict(color=node_colors_hex, size=[14 + a*20 for a in node_anomaly],
+                    hoverinfo='text',
+                    marker=dict(color=node_colors_hex,
+                                size=node_marker_size,
                                 line=dict(color='black', width=0.5))
                 )
 
-                # Edges (colored by lag)
-                def lag_color(lag):
+                # Edges: lines + arrowheads (colored by lag)
+                def lag_color(lag: int) -> str:
                     return '#32CD32' if lag > 0 else '#FF8C00' if lag == 0 else '#1E90FF'
 
-                edges_by_color = {
+                edges_lines = {
                     '#32CD32': {'x': [], 'y': []},
                     '#FF8C00': {'x': [], 'y': []},
                     '#1E90FF': {'x': [], 'y': []},
                 }
+                arrow_heads = {
+                    '#32CD32': {'x': [], 'y': [], 'text': []},
+                    '#FF8C00': {'x': [], 'y': [], 'text': []},
+                    '#1E90FF': {'x': [], 'y': [], 'text': []},
+                }
 
                 for u, v, data in G.edges(data=True):
-                    if data.get('score', 0) < min_edge_score or data.get('weight', 0) < min_edge_infl:
+                    # Thresholds
+                    edge_score = float(data.get('score', 0.0))
+                    edge_weight = float(data.get('weight', 0.0))
+                    if edge_score < float(min_edge_score) or edge_weight < float(min_edge_infl):
                         continue
                     if u not in pos or v not in pos:
                         continue
+
                     x0, y0 = pos[u]
                     x1, y1 = pos[v]
-                    color = lag_color(data.get('lag', 0))
-                    edges_by_color[color]['x'].extend([x0, x1, None])
-                    edges_by_color[color]['y'].extend([y0, y1, None])
+                    color = lag_color(int(data.get('lag', 0)))
 
-                color_traces = [
-                    go.Scatter(
-                        x=pts['x'], y=pts['y'], mode='lines',
-                        line=dict(width=edge_line_width, color=color),
-                        opacity=edge_opacity, showlegend=False
+                    # Lines (no hover for performance)
+                    edges_lines[color]['x'].extend([x0, x1, None])
+                    edges_lines[color]['y'].extend([y0, y1, None])
+
+                    # Prepare hover text with **explicit** coercion and precision
+                    score = float(data.get('score', 0.0))
+                    infl = float(data.get('weight', 0.0))
+                    lag = int(data.get('lag', 0))
+                    lag_score = float(data.get('lag_score', 0.0))
+                    patt = float(data.get('patt', 0.0))
+                    sev_drift = float(data.get('sev_drift', 0.0))
+                    exc_sim = float(data.get('exc_sim', 0.0))
+                    anom_grad = float(data.get('anom_grad', 0.0))
+
+                    hover = (
+                        f"C{u+1} → C{v+1}<br>"
+                        f"score={score:.2f}, infl={infl:.2f}<br>"
+                        f"lag={lag}, lag_score={lag_score:.2f}<br>"
+                        f"patt={patt:.2f}, sev_drift={sev_drift:.2f}, "
+                        f"exc_sim={exc_sim:.2f}, anom_grad={anom_grad:.2f}"
                     )
-                    for color, pts in edges_by_color.items() if pts['x']
-                ]
+
+                    arrow_heads[color]['x'].append(x1)
+                    arrow_heads[color]['y'].append(y1)
+                    arrow_heads[color]['text'].append(hover)
+
+                # Build traces
+                edge_traces = []
+                for color, pts in edges_lines.items():
+                    if pts['x']:
+                        edge_traces.append(
+                            go.Scatter(
+                                x=pts['x'], y=pts['y'], mode='lines',
+                                line=dict(width=edge_line_width, color=color),
+                                opacity=edge_opacity,
+                                hoverinfo='skip',
+                                showlegend=False
+                            )
+                        )
+                for color, heads in arrow_heads.items():
+                    if heads['x']:
+                        edge_traces.append(
+                            go.Scatter(
+                                x=heads['x'], y=heads['y'], mode='markers',
+                                marker=dict(symbol='triangle-up',
+                                            size=max(8, int(arrow_scale)),
+                                            color=color),
+                                text=heads['text'],
+                                hoverinfo='text',
+                                showlegend=False
+                            )
+                        )
+
+                # Axis bounds
+                xs = [p[0] for p in pos.values()]
+                ys = [p[1] for p in pos.values()]
+                xmin, xmax = (min(xs) - 0.15, max(xs) + 0.15) if xs else (-1, 1)
+                ymin, ymax = (min(ys) - 0.15, max(ys) + 0.15) if ys else (-1, 1)
 
                 fig = go.Figure(
-                    data=color_traces + [node_trace],
+                    data=edge_traces + [node_trace],
                     layout=go.Layout(
-                        title="🔗 RCA Topology — Causal Analysis",
+                        title="RCA Topology — Causal Analysis",
                         height=700, showlegend=False,
                         xaxis=dict(showgrid=False, showticklabels=False, range=[xmin, xmax]),
                         yaxis=dict(showgrid=False, showticklabels=False, range=[ymin, ymax]),
                     )
                 )
                 rca_ph.plotly_chart(fig, use_container_width=True)
+
             else:
-                rca_ph.info("No edges above thresholds or Plotly unavailable.")
+                # ---- Matplotlib fallback (Plotly not available or no edges above thresholds) ----
+                if G.number_of_edges() > 0:
+                    fig, ax = plt.subplots(figsize=(12, 8))
+                    nx.draw_networkx_nodes(
+                        G, pos,
+                        node_size=[max(80, 80 + float(a) * 60) for a in node_anomaly],
+                        node_color=node_anomaly, cmap=plt.cm.Reds, ax=ax
+                    )
+                    for (u, v, data) in G.edges(data=True):
+                        edge_score = float(data.get('score', 0.0))
+                        edge_weight = float(data.get('weight', 0.0))
+                        if edge_score < float(min_edge_score) or edge_weight < float(min_edge_infl):
+                            continue
+                        nx.draw_networkx_edges(
+                            G, pos, edgelist=[(u, v)],
+                            width=edge_line_width, alpha=edge_opacity,
+                            arrows=True, arrowstyle='-|>', arrowsize=20, ax=ax
+                        )
+                    nx.draw_networkx_labels(G, pos, labels={n: f"C{n+1}" for n in G.nodes()}, font_size=9, ax=ax)
+                    ax.set_title("RCA Topology — Causal Analysis (matplotlib fallback)")
+                    ax.axis('off')
+                    rca_ph.pyplot(fig)
+                    plt.close(fig)
+                else:
+                    rca_ph.info("No edges above thresholds (nothing to render).")
+
         except Exception as e:
             rca_ph.warning(f"RCA topology rendering failed: {e}")
 
@@ -1302,3 +1416,4 @@ if uploaded_file:
             st.subheader("Derived Causal Chains (Top)")
             for idx, chain in enumerate(causal_chains[:5], start=1):
                 chain_desc = " → ".join([f"C{c+1}" for c in chain])
+                st.write(f"{idx}. {chain_desc}")
