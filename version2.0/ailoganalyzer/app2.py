@@ -1,7 +1,6 @@
-##############################################
-# app.py — PART 1/3
-# Parsing, Storage, Analytics, Structure Engine
-##############################################
+# ============================================================
+# app.py — SHATCAR Log Analyzer (spaCy + Transformer + Chat)
+# ============================================================
 
 import os
 import re
@@ -23,10 +22,16 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
 
+# Optional robust date parsing
+try:
+    from dateutil import parser as date_parser
+    HAS_DATEUTIL = True
+except ImportError:
+    HAS_DATEUTIL = False
 
-# ==============================================================
-#                 GLOBAL CONFIG
-# ==============================================================
+# -----------------------------------------------------------------------------
+# CONFIG
+# -----------------------------------------------------------------------------
 DB_PATH = "logs.db"
 SPACY_MODEL = "en_core_web_sm"
 
@@ -36,24 +41,19 @@ SHATCAR_VOCAB_PATH = "shatcar_vocab.json"
 SEM_DIM = 300
 STRUCT_MAX_LEN = 32
 
-# NEW stronger model dims
-SHATCAR_D_MODEL = 192   # was 96
+SHATCAR_D_MODEL = 192
 SHATCAR_NUM_CLASSES = 2
 
 MAX_SERVICES = 200
 MAX_LEVEL_EMBED = 10
 
-
-# ==============================================================
-#                 TIME PARSING UTILITIES
-# ==============================================================
-try:
-    from dateutil import parser as date_parser
-    HAS_DATEUTIL = True
-except ImportError:
-    HAS_DATEUTIL = False
+SAFE_MIN_TS = datetime(1970, 1, 1)
+SAFE_MAX_TS = datetime(2100, 1, 1)
 
 
+# -----------------------------------------------------------------------------
+# BASIC STRUCTURES
+# -----------------------------------------------------------------------------
 @dataclass
 class LogEvent:
     raw: str
@@ -66,17 +66,21 @@ class LogEvent:
 
 
 def normalize_ts(ts: Optional[datetime]) -> datetime:
-    """Safely converts timestamp to offset-naive."""
+    """Normalize timestamps to naive datetimes and clamp to safe range."""
     if ts is None:
-        return datetime.min.replace(tzinfo=None)
+        return SAFE_MIN_TS
     if ts.tzinfo is not None:
-        return ts.astimezone().replace(tzinfo=None)
+        ts = ts.astimezone().replace(tzinfo=None)
+    if ts.year < SAFE_MIN_TS.year:
+        ts = SAFE_MIN_TS
+    if ts.year > SAFE_MAX_TS.year:
+        ts = SAFE_MAX_TS
     return ts
 
 
-# ==============================================================
-#                 SQLITE STORAGE
-# ==============================================================
+# -----------------------------------------------------------------------------
+# DB HELPERS
+# -----------------------------------------------------------------------------
 def init_db():
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
@@ -99,61 +103,6 @@ def save_logs_to_db(lines: List[str]):
     conn.commit()
     conn.close()
 
-# ============================================================================
-#                   ROOT CAUSE ANALYSIS (HEURISTIC)
-# ============================================================================
-def root_cause_analysis(events: List[LogEvent]) -> Dict[str, Any]:
-    """
-    Heuristic root cause detection:
-    - Group events by trace_id
-    - Identify the earliest ERROR/CRITICAL/FATAL within each trace
-    - Aggregate most common error services and messages
-    """
-    traces: Dict[str, List[LogEvent]] = defaultdict(list)
-
-    # Group events by trace_id (fallback "__NO_TRACE__")
-    for e in events:
-        key = e.trace_id or "__NO_TRACE__"
-        traces[key].append(e)
-
-    root_services = Counter()
-    root_messages = Counter()
-    per_trace_results = []
-
-    for trace_id, evs in traces.items():
-        # Sort inside trace chronologically
-        evs_sorted = sorted(evs, key=lambda e: (normalize_ts(e.timestamp), e.line_no))
-
-        root_event = None
-        for e in evs_sorted:
-            if e.level in ("ERROR", "CRITICAL", "FATAL"):
-                root_event = e
-                break
-
-        if root_event:
-            svc = root_event.service or "UNK"
-            msg = root_event.message[:200]
-
-            root_services[svc] += 1
-            root_messages[msg] += 1
-
-            per_trace_results.append({
-                "trace_id": trace_id,
-                "service": svc,
-                "message": msg,
-                "time": (
-                    root_event.timestamp.isoformat()
-                    if root_event.timestamp else None
-                ),
-            })
-
-    # Return structured RCA data
-    return {
-        "per_trace": per_trace_results,
-        "top_services": root_services.most_common(10),
-        "top_messages": root_messages.most_common(10),
-    }
-
 
 def load_logs_from_db() -> List[str]:
     conn = sqlite3.connect(DB_PATH)
@@ -164,16 +113,79 @@ def load_logs_from_db() -> List[str]:
     return [r[0] for r in rows]
 
 
-# ==============================================================
-#             LOG PARSING — TEXT + JSON
-# ==============================================================
+# -----------------------------------------------------------------------------
+# LOG PARSING (TEXT + JSON)
+# -----------------------------------------------------------------------------
 TIMESTAMP_REGEXES = [
     r"^\s*(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+\-]\d{2}:\d{2})?)",
     r"^\s*(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}(?:,\d+)?)(?:\s|$)",
     r"^\s*(\d{2}/\d{2}/\d{4} \d{2}:\d{2}:\d{2})",
 ]
 
-LEVEL_REGEX = re.compile(r"\b(INFO|WARN|WARNING|ERROR|DEBUG|TRACE|CRITICAL|FATAL)\b")
+JSON_TIMESTAMP_KEYS = ["timestamp", "time", "ts"]
+JSON_LEVEL_KEYS = ["level", "severity", "loglevel"]
+JSON_SERVICE_KEYS = ["service", "svc", "module"]
+JSON_TRACE_KEYS = ["trace_id", "trace", "req_id", "request_id", "correlation_id"]
+JSON_MESSAGE_KEYS = ["message", "msg", "event", "log", "text"]
+
+
+def parse_timestamp(line: str) -> Tuple[Optional[datetime], str]:
+    """Extract timestamp at beginning if present, return (datetime, rest)."""
+    for pat in TIMESTAMP_REGEXES:
+        m = re.search(pat, line)
+        if m:
+            ts_str = m.group(1)
+            rest = line[m.end():].lstrip()
+            dt = None
+            if HAS_DATEUTIL:
+                try:
+                    dt = date_parser.parse(ts_str)
+                except Exception:
+                    dt = None
+            else:
+                try:
+                    dt = datetime.fromisoformat(ts_str.replace("Z", "+00:00"))
+                except Exception:
+                    dt = None
+            return dt, rest
+
+    if HAS_DATEUTIL:
+        try:
+            dt = date_parser.parse(line, fuzzy=True)
+            return dt, line
+        except Exception:
+            pass
+
+    return None, line
+
+
+def parse_level(line: str) -> Optional[str]:
+    """
+    Robust log level detection:
+    - INFO, WARN, WARNING, ERROR, DEBUG, TRACE, CRITICAL, FATAL
+    - [INFO], level=INFO, severity=ERROR, log_level=DEBUG, etc.
+    """
+    m = re.search(r"\b(INFO|WARN|WARNING|ERROR|DEBUG|TRACE|CRITICAL|FATAL)\b", line, re.IGNORECASE)
+    if m:
+        lvl = m.group(1).upper()
+        return "WARN" if lvl == "WARNING" else lvl
+
+    m = re.search(r"[\[\{\(<](INFO|WARN|WARNING|ERROR|DEBUG|TRACE|CRITICAL|FATAL)[\]\}\)>]", line, re.IGNORECASE)
+    if m:
+        lvl = m.group(1).upper()
+        return "WARN" if lvl == "WARNING" else lvl
+
+    m = re.search(
+        r"(level|severity|log[_\-]?level)\s*[:=]\s*(INFO|WARN|WARNING|ERROR|DEBUG|TRACE|CRITICAL|FATAL)",
+        line,
+        re.IGNORECASE,
+    )
+    if m:
+        lvl = m.group(2).upper()
+        return "WARN" if lvl == "WARNING" else lvl
+
+    return None
+
 
 SERVICE_PATTERNS = [
     re.compile(r"\bsvc=([A-Za-z0-9_\-\.]+)\b"),
@@ -184,66 +196,6 @@ SERVICE_PATTERNS = [
 TRACE_PATTERNS = [
     re.compile(r"\b(trace_id|trace|request_id|req_id|corr_id|correlation_id)=([A-Za-z0-9\-\_:]+)\b")
 ]
-
-
-def parse_timestamp(line: str) -> Tuple[Optional[datetime], str]:
-    """Extract timestamp if present, return (datetime, rest_of_line)."""
-    for pat in TIMESTAMP_REGEXES:
-        m = re.search(pat, line)
-        if m:
-            ts_str = m.group(1)
-            rest = line[m.end():].lstrip()
-            if HAS_DATEUTIL:
-                try:
-                    return date_parser.parse(ts_str), rest
-                except:
-                    return None, rest
-            else:
-                try:
-                    dt = datetime.fromisoformat(ts_str.replace("Z", "+00:00"))
-                    return dt, rest
-                except:
-                    return None, rest
-
-    if HAS_DATEUTIL:
-        try:
-            dt = date_parser.parse(line, fuzzy=True)
-            return dt, line
-        except:
-            return None, line
-
-    return None, line
-
-
-def parse_level(line: str) -> Optional[str]:
-    """
-    Robust log level detector:
-    - Works even after timestamp removal
-    - Supports: INFO, info, Info, [INFO], level=INFO, severity=ERROR, etc.
-    - Never returns UNKNOWN if a real level exists.
-    """
-
-    # 1) direct simple patterns
-    m = re.search(r"\b(INFO|WARN|WARNING|ERROR|DEBUG|TRACE|CRITICAL|FATAL)\b", line, re.IGNORECASE)
-    if m:
-        lvl = m.group(1).upper()
-        return "WARN" if lvl == "WARNING" else lvl
-
-    # 2) bracketed: [INFO], {ERROR}, <DEBUG>
-    m = re.search(r"[\[\{\(<](INFO|WARN|WARNING|ERROR|DEBUG|TRACE|CRITICAL|FATAL)[\]\}\)>]", line, re.IGNORECASE)
-    if m:
-        lvl = m.group(1).upper()
-        return "WARN" if lvl == "WARNING" else lvl
-
-    # 3) key=value: level=INFO severity=ERROR log_level=DEBUG
-    m = re.search(r"(level|severity|log[_\-]?level)\s*[:=]\s*(INFO|WARN|WARNING|ERROR|DEBUG|TRACE|CRITICAL|FATAL)", 
-                  line, re.IGNORECASE)
-    if m:
-        lvl = m.group(2).upper()
-        return "WARN" if lvl == "WARNING" else lvl
-
-    return None   # allows UNKNOWN fallback
-
 
 
 def parse_service(line: str) -> Optional[str]:
@@ -263,23 +215,18 @@ def parse_trace_id(line: str) -> Optional[str]:
 
 
 def split_message(line: str) -> str:
-    """Remove level tags etc. at left side."""
-    s = line
-    s = re.sub(r"\[(INFO|WARN|WARNING|ERROR|DEBUG|TRACE|CRITICAL|FATAL)\]", "", s)
-    s = re.sub(r"\blevel=(INFO|WARN|WARNING|ERROR|DEBUG|TRACE|CRITICAL|FATAL)\b", "", s)
-    return s.strip() or line.strip()
-
-
-# JSON keys
-JSON_TIMESTAMP_KEYS = ["timestamp", "time", "ts"]
-JSON_LEVEL_KEYS = ["level", "severity", "loglevel"]
-JSON_SERVICE_KEYS = ["service", "svc", "module"]
-JSON_TRACE_KEYS = ["trace_id", "trace", "req_id", "request_id"]
-JSON_MESSAGE_KEYS = ["message", "msg", "event", "log"]
+    s = re.sub(r"\[(INFO|WARN|WARNING|ERROR|DEBUG|TRACE|CRITICAL|FATAL)\]", "", line, flags=re.IGNORECASE)
+    s = re.sub(
+        r"\b(level|severity|log[_\-]?level)\s*[:=]\s*(INFO|WARN|WARNING|ERROR|DEBUG|TRACE|CRITICAL|FATAL)\b",
+        "",
+        s,
+        flags=re.IGNORECASE,
+    )
+    s = re.sub(r"\s+", " ", s).strip()
+    return s or line.strip()
 
 
 def try_parse_json_log(line: str) -> Optional[LogEvent]:
-    """Try to parse a JSON log line. If valid dict, convert to LogEvent."""
     try:
         obj = json.loads(line)
     except json.JSONDecodeError:
@@ -287,42 +234,44 @@ def try_parse_json_log(line: str) -> Optional[LogEvent]:
     if not isinstance(obj, dict):
         return None
 
+    # Timestamp
     ts = None
     for k in JSON_TIMESTAMP_KEYS:
         if k in obj:
             v = obj[k]
-            if isinstance(v, (float, int)):
-                try:
+            try:
+                if isinstance(v, (int, float)):
                     ts = datetime.fromtimestamp(v / 1000.0)
-                except:
-                    ts = None
-            elif isinstance(v, str):
-                try:
-                    ts = date_parser.parse(v)
-                except:
-                    ts = None
+                elif isinstance(v, str):
+                    ts = date_parser.parse(v) if HAS_DATEUTIL else datetime.fromisoformat(v.replace("Z", "+00:00"))
+            except Exception:
+                ts = None
             break
 
+    # Level
     lvl = None
     for k in JSON_LEVEL_KEYS:
         if k in obj:
-            lvl = str(obj[k]).upper()
-            if lvl == "WARNING":
-                lvl = "WARN"
+            val = str(obj[k]).upper()
+            if val in ["INFO", "WARN", "WARNING", "ERROR", "DEBUG", "TRACE", "CRITICAL", "FATAL"]:
+                lvl = "WARN" if val == "WARNING" else val
             break
 
+    # Service
     svc = None
     for k in JSON_SERVICE_KEYS:
         if k in obj:
             svc = str(obj[k])
             break
 
+    # Trace
     trace = None
     for k in JSON_TRACE_KEYS:
         if k in obj:
             trace = str(obj[k])
             break
 
+    # Message
     msg = None
     for k in JSON_MESSAGE_KEYS:
         if k in obj:
@@ -332,31 +281,33 @@ def try_parse_json_log(line: str) -> Optional[LogEvent]:
         msg = json.dumps(obj)
 
     return LogEvent(
-        raw=line,
+        raw=line.strip(),
         timestamp=ts,
         level=lvl,
         service=svc,
         trace_id=trace,
         message=msg,
-        line_no=-1
+        line_no=-1,
     )
 
 
 def parse_logs(lines: List[str]) -> List[LogEvent]:
-    events = []
+    events: List[LogEvent] = []
     for i, line in enumerate(lines):
         s = line.strip()
+        if not s:
+            continue
 
         j = try_parse_json_log(s)
-        if j:
+        if j is not None:
             j.line_no = i
             events.append(j)
             continue
 
         ts, rem = parse_timestamp(s)
         lvl = parse_level(s)
-        svc = parse_service(s)
-        trace = parse_trace_id(s)
+        svc = parse_service(rem)
+        trace = parse_trace_id(rem)
         msg = split_message(rem)
 
         events.append(
@@ -375,44 +326,32 @@ def parse_logs(lines: List[str]) -> List[LogEvent]:
     return events
 
 
-# ==============================================================
-#              TEMPORAL ANALYTICS
-# ==============================================================
-def build_time_buckets(events: List[LogEvent], bucket="minute"):
+# -----------------------------------------------------------------------------
+# TEMPORAL ANALYTICS (SAFE)
+# -----------------------------------------------------------------------------
+def build_time_buckets(events: List[LogEvent], bucket: str = "minute"):
     """
-    Fully safe bucketing:
-    - Never returns invalid datetimes (matplotlib ordinal-safe)
-    - Missing timestamps get substituted with SAFE_MIN_TS
-    - Ensures uniform key types
+    Safe bucketing:
+    - If any timestamp exists: use datetime buckets (minute resolution), clamped to safe range.
+    - If no timestamps: use integer buckets based on line index.
     """
-    SAFE_MIN_TS = datetime(1970, 1, 1)
-
     if not events:
         return {}, True
 
     have_any_ts = any(e.timestamp is not None for e in events)
-
     buckets = defaultdict(lambda: {"total": 0, "errors": 0})
 
     if have_any_ts:
-        # ALL keys will be datetime
         for e in events:
             if e.timestamp is None:
                 key = SAFE_MIN_TS
             else:
                 ts = normalize_ts(e.timestamp)
-                # sanitize all timestamps
-                if ts.year < 1970:
-                    ts = SAFE_MIN_TS
-                if ts.year > 2100:
-                    ts = datetime(2100, 1, 1)
                 key = ts.replace(second=0, microsecond=0)
-
             buckets[key]["total"] += 1
             if e.level in ("ERROR", "CRITICAL", "FATAL"):
                 buckets[key]["errors"] += 1
     else:
-        # use int buckets
         for e in events:
             key = e.line_no // 20
             buckets[key]["total"] += 1
@@ -422,54 +361,124 @@ def build_time_buckets(events: List[LogEvent], bucket="minute"):
     return buckets, have_any_ts
 
 
-
-def plot_temporal_analytics(events):
+def plot_temporal_analytics(events: List[LogEvent]):
     buckets, is_time = build_time_buckets(events)
     if not buckets:
         st.info("No temporal data.")
         return
 
-    keys = list(buckets.keys())
+    keys = sorted(buckets.keys())
     totals = [buckets[k]["total"] for k in keys]
     errors = [buckets[k]["errors"] for k in keys]
 
     plt.figure(figsize=(10, 4))
 
     if is_time:
-        # Convert datetimes to matplotlib ordinals safely
-        safe_x = []
-        for dt in keys:
-            try:
-                safe_x.append(mdates.date2num(dt))
-            except:
-                # If ANY error persists, sanitize to safe minimum
-                safe_x.append(mdates.date2num(datetime(1970, 1, 1)))
-
-        plt.plot_date(safe_x, totals, "-")
-        plt.plot_date(safe_x, errors, "-")
-
+        xs = [mdates.date2num(k) for k in keys]
+        plt.plot_date(xs, totals, "-", label="Total logs")
+        plt.plot_date(xs, errors, "-", label="Error logs")
         plt.gca().xaxis.set_major_formatter(mdates.DateFormatter("%H:%M:%S"))
         plt.gcf().autofmt_xdate()
+        plt.xlabel("Time")
     else:
-        # Keys are integers
-        plt.plot(keys, totals, "-")
-        plt.plot(keys, errors, "-")
+        plt.plot(keys, totals, "-", label="Total logs")
+        plt.plot(keys, errors, "-", label="Error logs")
+        plt.xlabel("Bucket index (by lines)")
 
-    plt.xlabel("Time" if is_time else "Line Buckets")
     plt.ylabel("Count")
+    plt.title("Log Volume & Errors Over Time")
+    plt.legend()
     plt.tight_layout()
-
     st.pyplot(plt.gcf())
     plt.close()
 
 
+# -----------------------------------------------------------------------------
+# STRUCTURAL PATTERNS
+# -----------------------------------------------------------------------------
+NUM_PATTERN = re.compile(r"\b\d+\b")
+HEX_PATTERN = re.compile(r"\b0x[0-9A-Fa-f]+\b")
+UUID_PATTERN = re.compile(r"\b[0-9a-fA-F\-]{32,36}\b")
+IP_PATTERN = re.compile(r"\b\d{1,3}(\.\d{1,3}){3}\b")
 
-# ==============================================================
-#         BASELINE TOPOLOGY (fallback)
-# ==============================================================
+
+def message_template(msg: str) -> str:
+    s = HEX_PATTERN.sub("<HEX>", msg)
+    s = UUID_PATTERN.sub("<UUID>", s)
+    s = IP_PATTERN.sub("<IP>", s)
+    s = NUM_PATTERN.sub("<NUM>", s)
+    s = re.sub(r"\s+", " ", s).strip()
+    return s
+
+
+def extract_structural_patterns(events: List[LogEvent]):
+    counter = Counter()
+    examples: Dict[str, str] = {}
+    for e in events:
+        t = message_template(e.message)
+        counter[t] += 1
+        if t not in examples:
+            examples[t] = e.message
+
+    rows = []
+    for tmpl, cnt in counter.most_common(15):
+        rows.append(
+            {
+                "Template": tmpl,
+                "Count": cnt,
+                "Example": examples[tmpl][:200],
+            }
+        )
+    return rows
+
+
+# -----------------------------------------------------------------------------
+# ROOT CAUSE ANALYSIS (HEURISTIC)
+# -----------------------------------------------------------------------------
+def root_cause_analysis(events: List[LogEvent]) -> Dict[str, Any]:
+    traces: Dict[str, List[LogEvent]] = defaultdict(list)
+    for e in events:
+        key = e.trace_id or "__NO_TRACE__"
+        traces[key].append(e)
+
+    root_services = Counter()
+    root_messages = Counter()
+    per_trace_results = []
+
+    for trace_id, evs in traces.items():
+        evs_sorted = sorted(evs, key=lambda e: (normalize_ts(e.timestamp), e.line_no))
+        root_event = None
+        for e in evs_sorted:
+            if e.level in ("ERROR", "CRITICAL", "FATAL"):
+                root_event = e
+                break
+        if root_event:
+            svc = root_event.service or "UNK"
+            msg = root_event.message[:200]
+            root_services[svc] += 1
+            root_messages[msg] += 1
+            per_trace_results.append(
+                {
+                    "trace_id": trace_id,
+                    "service": svc,
+                    "message": msg,
+                    "time": root_event.timestamp.isoformat() if root_event.timestamp else None,
+                }
+            )
+
+    return {
+        "per_trace": per_trace_results,
+        "top_services": root_services.most_common(10),
+        "top_messages": root_messages.most_common(10),
+    }
+
+
+# -----------------------------------------------------------------------------
+# BASELINE TOPOLOGY (TRACE-BASED)
+# -----------------------------------------------------------------------------
 def build_topology_baseline(events: List[LogEvent]) -> nx.DiGraph:
     G = nx.DiGraph()
-    traces = defaultdict(list)
+    traces: Dict[str, List[LogEvent]] = defaultdict(list)
 
     for e in events:
         key = e.trace_id or "__NOTRACE__"
@@ -500,14 +509,12 @@ def draw_topology(G: nx.DiGraph):
     plt.figure(figsize=(13, 9))
     plt.axis("off")
 
-    # Stable layout: if small graph use shell_layout, else spring_layout
     if len(G.nodes()) <= 3:
         pos = nx.circular_layout(G)
     else:
         pos = nx.spring_layout(G, k=0.9, seed=42)
 
-    # Node colors
-    def color(s):
+    def color(s: str):
         s = s.lower()
         if "gateway" in s or "api" in s:
             return "#ff7f0e"
@@ -522,20 +529,15 @@ def draw_topology(G: nx.DiGraph):
         return "#7f7f7f"
 
     node_colors = [color(n) for n in G.nodes()]
-
-    # Edge weights
     weights = [G[u][v].get("weight", 0.1) for u, v in G.edges()]
+
     if weights:
         maxw = max(weights)
         widths = [2 + 6 * (w / maxw) for w in weights]
     else:
         widths = 1
 
-    # Edge colors: highlight strong edges
-    edge_colors = [
-        "#d62728" if G[u][v].get("weight", 0) > 0.7 else "#555555"
-        for u, v in G.edges()
-    ]
+    edge_colors = ["#d62728" if G[u][v].get("weight", 0) > 0.7 else "#555555" for u, v in G.edges()]
 
     nx.draw_networkx_nodes(G, pos, node_color=node_colors, node_size=1800)
     nx.draw_networkx_edges(
@@ -549,119 +551,82 @@ def draw_topology(G: nx.DiGraph):
     )
     nx.draw_networkx_labels(G, pos, font_size=13, font_weight="bold")
 
-    # Edge labels (weights)
-    edge_labels = {(u, v): round(G[u][v]["weight"], 2) for u, v in G.edges()}
+    edge_labels = {(u, v): round(G[u][v].get("weight", 0.0), 2) for u, v in G.edges()}
     nx.draw_networkx_edge_labels(G, pos, edge_labels=edge_labels, font_size=11)
 
     st.pyplot(plt.gcf())
     plt.close()
 
-# ==============================================================
-#             STRUCTURAL PATTERNS (TEMPLATES)
-# ==============================================================
-NUM_PATTERN = re.compile(r"\b\d+\b")
-HEX_PATTERN = re.compile(r"\b0x[0-9A-Fa-f]+\b")
-UUID_PATTERN = re.compile(r"\b[0-9a-fA-F\-]{32,36}\b")
-IP_PATTERN = re.compile(r"\b\d{1,3}(\.\d{1,3}){3}\b")
+
+# -----------------------------------------------------------------------------
+# spaCy DEEP PARSING + SEMANTIC VECTOR
+# -----------------------------------------------------------------------------
+def advanced_spacy_parse(msg: str, nlp):
+    """
+    Deep semantic extraction using spaCy:
+    - Nouns
+    - Verbs
+    - Subject-Verb-Object triples
+    """
+    doc = nlp(msg)
+
+    nouns = []
+    verbs = []
+    svos = []
+
+    for token in doc:
+        if token.dep_ in ("ROOT", "conj") and token.pos_ == "VERB":
+            subj = [w.text for w in token.lefts if w.dep_ == "nsubj"]
+            obj = [w.text for w in token.rights if w.dep_ in ("dobj", "attr", "pobj")]
+            if subj and obj:
+                svos.append((subj[0], token.lemma_, obj[0]))
+
+    for tok in doc:
+        if tok.pos_ == "NOUN" and not tok.is_stop:
+            nouns.append(tok.lemma_.lower())
+        if tok.pos_ == "VERB" and not tok.is_stop:
+            verbs.append(tok.lemma_.lower())
+
+    return {"nouns": nouns, "verbs": verbs, "svos": svos}
 
 
-def message_template(msg: str) -> str:
-    s = NUM_PATTERN.sub("<NUM>", msg)
-    s = HEX_PATTERN.sub("<HEX>", s)
-    s = UUID_PATTERN.sub("<UUID>", s)
-    s = IP_PATTERN.sub("<IP>", s)
-    s = re.sub(r"\s+", " ", s).strip()
-    return s
-
-
-def extract_structural_patterns(events: List[LogEvent]):
-    counter = Counter()
-    examples = {}
-
-    for e in events:
-        t = message_template(e.message)
-        counter[t] += 1
-        if t not in examples:
-            examples[t] = e.message
-
-    rows = []
-    for tmpl, cnt in counter.most_common(15):
-        rows.append({
-            "Template": tmpl,
-            "Count": cnt,
-            "Example": examples[tmpl][:200],
-        })
-    return rows
-
-
-# ==============================================================
-#      HEURISTIC FALLBACK SUMMARY (used if SHATCAR missing)
-# ==============================================================
-def build_summary(events: List[LogEvent], nlp) -> str:
-    if not events:
-        return "No logs found."
-
-    services = Counter(e.service or "UNK" for e in events)
-    levels = Counter(e.level or "UNKNOWN" for e in events)
-    errors = [e for e in events if e.level in ("ERROR", "CRITICAL", "FATAL")]
-
-    templates = Counter(message_template(e.message) for e in events)
-
-    top_services = services.most_common(3)
-    top_templates = templates.most_common(5)
-
-    timestamps = [normalize_ts(e.timestamp) for e in events if e.timestamp]
-    if timestamps:
-        span = (timestamps[-1] - timestamps[0]).total_seconds()
-        if span < 60:
-            tl = "Logs occurred in a short burst."
-        elif span < 300:
-            tl = "Logs span a few minutes."
+def semantic_vector(msg: str, nlp) -> List[float]:
+    """
+    Hybrid semantic vector:
+      - spaCy dense vector (if available)
+      - plus hashed contributions from nouns/verbs/SVOs
+    """
+    doc = nlp(msg)
+    if doc.vector is not None and len(doc.vector) > 0:
+        base = doc.vector.tolist()
+        if len(base) > SEM_DIM:
+            base = base[:SEM_DIM]
         else:
-            tl = "Logs span a long-running window."
+            base = base + [0.0] * (SEM_DIM - len(base))
     else:
-        tl = "Timestamps missing or inconsistent."
+        base = [0.0] * SEM_DIM
 
-    if not errors:
-        err_text = "No errors detected."
-    else:
-        err_services = Counter(e.service or "UNK" for e in errors)
-        main_svc = err_services.most_common(1)[0][0]
-        err_text = f"{len(errors)} errors detected, mainly in `{main_svc}`."
+    info = advanced_spacy_parse(msg, nlp)
 
-    template_lines = []
-    for t, c in top_templates:
-        friendly = t.replace("<NUM>", "numbers") \
-                    .replace("<UUID>", "UUIDs") \
-                    .replace("<HEX>", "hex values") \
-                    .replace("<IP>", "IP addresses")
-        template_lines.append(f"- {friendly} (~{c})")
+    extra = [0.0] * SEM_DIM
+    for n in info["nouns"][:10]:
+        idx = abs(hash("N:" + n)) % SEM_DIM
+        extra[idx] += 1.0
+    for v in info["verbs"][:10]:
+        idx = abs(hash("V:" + v)) % SEM_DIM
+        extra[idx] += 1.5
+    for s, v, o in info["svos"][:5]:
+        idx = abs(hash(f"SVO:{s}:{v}:{o}")) % SEM_DIM
+        extra[idx] += 2.0
 
-    summary = f"""
-Heuristic Summary (fallback)
-----------------------------
-Log span: {tl}
+    combined = [a + b for a, b in zip(base, extra)]
+    norm = (sum(x * x for x in combined) ** 0.5) or 1.0
+    return [x / norm for x in combined]
 
-Top services:
-{", ".join(f"{svc} ({cnt})" for svc, cnt in top_services)}
 
-Errors:
-{err_text}
-
-Common log patterns:
-{chr(10).join(template_lines) if template_lines else "None"}
-""".strip()
-
-    return summary
-##############################################
-# app.py — PART 2/3
-# Upgraded SHATCAR + Training + Topology + Secure Summary
-##############################################
-
-# ============================================================================
-#                      SHATCAR (UNIFIED TRANSFORMER)
-# ============================================================================
-
+# -----------------------------------------------------------------------------
+# SHATCAR TRANSFORMER
+# -----------------------------------------------------------------------------
 class PositionalEncoding(nn.Module):
     def __init__(self, d_model: int, max_len: int = 500):
         super().__init__()
@@ -680,13 +645,9 @@ class PositionalEncoding(nn.Module):
 class SHATCAR(nn.Module):
     """
     Structural-Hierarchical Adaptive Transformer with Context-Aware Routing.
-
-    Stronger attention than base version:
-      - d_model = 192, nhead = 6 (32-dim heads)
-      - 2 encoder layers per level
-      - dropout for robustness
-      - semantic + level + service + time context fused into token space
-      - CAR gating across levels
+    Stronger attention:
+      - d_model = 192, nhead = 6
+      - 2 encoder layers per level, 3 levels
     """
 
     def __init__(
@@ -705,17 +666,14 @@ class SHATCAR(nn.Module):
         self.d_model = d_model
         self.num_levels = num_levels
 
-        # Structural token embedding + positional encoding
         self.struct_embed = nn.Embedding(vocab_size, d_model)
         self.pos = PositionalEncoding(d_model, max_len=max_len)
 
-        # Context channels
         self.semantic_proj = nn.Linear(SEM_DIM, d_model, bias=False)
         self.level_embed = nn.Embedding(max_levels_embed, d_model)
         self.service_embed = nn.Embedding(max_services, d_model)
         self.time_proj = nn.Linear(4, d_model)
 
-        # Stronger hierarchical transformer per level (2 layers)
         self.levels = nn.ModuleList([
             nn.TransformerEncoder(
                 nn.TransformerEncoderLayer(
@@ -730,7 +688,6 @@ class SHATCAR(nn.Module):
             for _ in range(num_levels)
         ])
 
-        # Context-aware router (CAR)
         self.router = nn.Sequential(
             nn.Linear(d_model, d_model),
             nn.ReLU(),
@@ -739,59 +696,93 @@ class SHATCAR(nn.Module):
             nn.Softmax(dim=-1),
         )
 
-        # Classification head (error vs non-error)
         self.dropout = nn.Dropout(0.2)
         self.cls = nn.Linear(d_model, num_classes)
 
     def forward(
         self,
-        struct_ids: torch.Tensor,   # (B, L)
-        mask: torch.Tensor,         # (B, L)
-        semantic_vecs: torch.Tensor,# (B, SEM_DIM)
-        level_ids: torch.Tensor,    # (B,)
-        service_ids: torch.Tensor,  # (B,)
-        time_feats: torch.Tensor,   # (B, 4)
+        struct_ids: torch.Tensor,
+        mask: torch.Tensor,
+        semantic_vecs: torch.Tensor,
+        level_ids: torch.Tensor,
+        service_ids: torch.Tensor,
+        time_feats: torch.Tensor,
     ):
-        x = self.struct_embed(struct_ids)  # (B, L, D)
+        x = self.struct_embed(struct_ids)  # (B,L,D)
         x = self.pos(x)
 
-        # Context fusion
-        sem = self.semantic_proj(semantic_vecs)   # (B, D)
-        lvl = self.level_embed(level_ids)         # (B, D)
-        svc = self.service_embed(service_ids)     # (B, D)
-        tim = self.time_proj(time_feats)          # (B, D)
+        sem = self.semantic_proj(semantic_vecs)
+        lvl = self.level_embed(level_ids)
+        svc = self.service_embed(service_ids)
+        tim = self.time_proj(time_feats)
 
-        context = sem + lvl + svc + tim          # (B, D)
-        context_expanded = context.unsqueeze(1).repeat(1, x.size(1), 1)
-        fused = x + context_expanded             # (B, L, D)
+        context = sem + lvl + svc + tim  # (B,D)
+        fused = x + context.unsqueeze(1)
 
-        # Context-aware routing weights over levels
-        gating = self.router(context)            # (B, num_levels)
+        gating = self.router(context)  # (B, num_levels)
 
-        # Multi-level encoding
         outputs = []
         src_key_padding_mask = (mask == 0)
         for level in self.levels:
             out = level(fused, src_key_padding_mask=src_key_padding_mask)
             outputs.append(out)
 
-        stacked = torch.stack(outputs, dim=1)    # (B, num_levels, L, D)
+        stacked = torch.stack(outputs, dim=1)  # (B,num_levels,L,D)
         gating = gating.view(-1, self.num_levels, 1, 1)
-        fused_final = (stacked * gating).sum(dim=1)  # (B, L, D)
+        fused_final = (stacked * gating).sum(dim=1)  # (B,L,D)
 
         mask_f = mask.unsqueeze(-1).float()
         summed = (fused_final * mask_f).sum(dim=1)
         denom = mask_f.sum(dim=1).clamp(min=1.0)
-        pooled = summed / denom                  # (B, D)
+        pooled = summed / denom  # (B,D)
 
         pooled = self.dropout(pooled)
-        logits = self.cls(pooled)                # (B, num_classes)
+        logits = self.cls(pooled)
         return logits
 
+    def pooled_embedding(
+        self,
+        struct_ids: torch.Tensor,
+        mask: torch.Tensor,
+        semantic_vecs: torch.Tensor,
+        level_ids: torch.Tensor,
+        service_ids: torch.Tensor,
+        time_feats: torch.Tensor,
+    ) -> torch.Tensor:
+        """Return pooled latent embedding (B,D) instead of logits."""
+        x = self.struct_embed(struct_ids)
+        x = self.pos(x)
 
-# ============================================================================
-#                 SHATCAR DATA PREP & HELPERS
-# ============================================================================
+        sem = self.semantic_proj(semantic_vecs)
+        lvl = self.level_embed(level_ids)
+        svc = self.service_embed(service_ids)
+        tim = self.time_proj(time_feats)
+
+        context = sem + lvl + svc + tim
+        fused = x + context.unsqueeze(1)
+
+        gating = self.router(context)
+
+        outputs = []
+        src_key_padding_mask = (mask == 0)
+        for level in self.levels:
+            out = level(fused, src_key_padding_mask=src_key_padding_mask)
+            outputs.append(out)
+
+        stacked = torch.stack(outputs, dim=1)
+        gating = gating.view(-1, self.num_levels, 1, 1)
+        fused_final = (stacked * gating).sum(dim=1)
+
+        mask_f = mask.unsqueeze(-1).float()
+        summed = (fused_final * mask_f).sum(dim=1)
+        denom = mask_f.sum(dim=1).clamp(min=1.0)
+        pooled = summed / denom
+        return pooled  # (B,D)
+
+
+# -----------------------------------------------------------------------------
+# SHATCAR DATA HELPERS
+# -----------------------------------------------------------------------------
 def build_shatcar_vocab(events: List[LogEvent]) -> Dict[str, int]:
     freq = Counter()
     for e in events:
@@ -799,7 +790,7 @@ def build_shatcar_vocab(events: List[LogEvent]) -> Dict[str, int]:
         for t in tmpl.split():
             freq[t] += 1
     vocab = {"<PAD>": 0, "<UNK>": 1}
-    for tok, _ in freq.items():
+    for tok in freq.keys():
         if tok not in vocab:
             vocab[tok] = len(vocab)
     return vocab
@@ -853,36 +844,11 @@ def time_features(ts: Optional[datetime]) -> List[float]:
     if ts is None:
         return [0.0, 0.0, 0.0, 0.0]
     ts = normalize_ts(ts)
-    hour = ts.hour / 23.0 if ts.hour is not None else 0.0
-    minute = ts.minute / 59.0 if ts.minute is not None else 0.0
-    second = ts.second / 59.0 if ts.second is not None else 0.0
+    hour = ts.hour / 23.0
+    minute = ts.minute / 59.0
+    second = ts.second / 59.0
     is_weekend = 1.0 if ts.weekday() >= 5 else 0.0
     return [hour, minute, second, is_weekend]
-
-
-def semantic_vector(msg: str, nlp) -> List[float]:
-    """
-    300-dim semantic vector:
-     - prefer spaCy's dense vector if available
-     - fallback: hashed bag-of-words (normalized)
-    """
-    doc = nlp(msg)
-    if getattr(doc, "vector", None) is not None and doc.vector.size > 0:
-        v = doc.vector.tolist()
-        if len(v) >= SEM_DIM:
-            return v[:SEM_DIM]
-        else:
-            return v + [0.0] * (SEM_DIM - len(v))
-    # fallback
-    v = [0.0] * SEM_DIM
-    for tok in doc:
-        if tok.is_punct or tok.is_space:
-            continue
-        h = hash(tok.lemma_.lower())
-        idx = h % SEM_DIM
-        v[idx] += 1.0
-    norm = (sum(x * x for x in v) ** 0.5) or 1.0
-    return [x / norm for x in v]
 
 
 def get_shatcar_dataset(events: List[LogEvent], vocab: Dict[str, int], nlp):
@@ -901,7 +867,6 @@ def get_shatcar_dataset(events: List[LogEvent], vocab: Dict[str, int], nlp):
         ids, mask = template_to_ids(tmpl, vocab)
         X_ids.append(ids)
         X_masks.append(mask)
-
         sems.append(semantic_vector(e.message, nlp))
         lvl_ids.append(level_to_id(e.level))
         svc_ids.append(service_to_id(e.service, svc_map))
@@ -956,9 +921,6 @@ def save_shatcar_model(model: SHATCAR):
     torch.save(model.state_dict(), SHATCAR_MODEL_PATH)
 
 
-# ============================================================================
-#                      TRAIN / UPDATE SHATCAR
-# ============================================================================
 def train_shatcar(events: List[LogEvent], nlp, epochs: int, batch_size: int, device: torch.device):
     vocab = load_shatcar_vocab()
     if vocab is None:
@@ -967,7 +929,7 @@ def train_shatcar(events: List[LogEvent], nlp, epochs: int, batch_size: int, dev
 
     dataset = get_shatcar_dataset(events, vocab, nlp)
     if dataset is None:
-        st.error("SHATCAR dataset is empty (no tokenizable log messages). Cannot train.")
+        st.error("SHATCAR dataset is empty. Cannot train.")
         return None, vocab, 0.0
 
     X_ids = dataset["X_ids"]
@@ -987,7 +949,6 @@ def train_shatcar(events: List[LogEvent], nlp, epochs: int, batch_size: int, dev
     optimizer = optim.Adam(model.parameters(), lr=1e-3)
 
     model.train()
-
     for ep in range(epochs):
         perm = torch.randperm(N)
         X_ids = X_ids[perm]
@@ -1005,13 +966,13 @@ def train_shatcar(events: List[LogEvent], nlp, epochs: int, batch_size: int, dev
             end = min(start + batch_size, N)
             b_ids = X_ids[start:end].to(device)
             b_masks = X_masks[start:end].to(device)
-            b_sem = sems[start:end].to(device)
+            b_sems = sems[start:end].to(device)
             b_lvl = lvl_ids[start:end].to(device)
             b_svc = svc_ids[start:end].to(device)
             b_time = time_feats[start:end].to(device)
             b_y = y[start:end].to(device)
 
-            logits = model(b_ids, b_masks, b_sem, b_lvl, b_svc, b_time)
+            logits = model(b_ids, b_masks, b_sems, b_lvl, b_svc, b_time)
             loss = F.cross_entropy(logits, b_y)
 
             optimizer.zero_grad()
@@ -1026,24 +987,20 @@ def train_shatcar(events: List[LogEvent], nlp, epochs: int, batch_size: int, dev
         acc = total_correct / N
         st.write(f"Epoch {ep+1}/{epochs} • loss={avg_loss:.4f} • acc={acc:.3f}")
 
-    # Save model + vocab robustly
     try:
         save_shatcar_model(model)
         save_shatcar_vocab(vocab)
-        st.success(f"SHATCAR model saved to `{SHATCAR_MODEL_PATH}` and vocab to `{SHATCAR_VOCAB_PATH}`")
+        st.success(f"SHATCAR model saved → {SHATCAR_MODEL_PATH}, vocab → {SHATCAR_VOCAB_PATH}")
     except Exception as e:
         st.error(f"Failed to save SHATCAR model or vocab: {e}")
 
     return model, vocab, acc
 
 
-# ============================================================================
-#                      SHATCAR INFERENCE
-# ============================================================================
 def run_shatcar_inference(events: List[LogEvent], nlp, device: torch.device):
     vocab = load_shatcar_vocab()
     if vocab is None or not os.path.exists(SHATCAR_MODEL_PATH):
-        st.info("Unified SHATCAR model or vocab not found. Train it first.")
+        st.info("SHATCAR model/vocab not found. Train it in the last tab.")
         return
 
     model = load_shatcar_model(vocab_size=len(vocab), device=device)
@@ -1080,66 +1037,46 @@ def run_shatcar_inference(events: List[LogEvent], nlp, device: torch.device):
 
     rows = []
     for e, p in zip(subset, probs):
-        rows.append({
-            "Line": e.line_no,
-            "Level": e.level or "UNKNOWN",
-            "Service": e.service or "UNK",
-            "ErrorProb(SHATCAR)": round(p, 3),
-            "Message": e.message[:120],
-        })
+        rows.append(
+            {
+                "Line": e.line_no,
+                "Level": e.level or "UNKNOWN",
+                "Service": e.service or "UNK",
+                "ErrorProb(SHATCAR)": round(p, 3),
+                "Message": e.message[:120],
+            }
+        )
     st.table(rows)
 
 
-# ============================================================================
-#            TRANSFORMER-DRIVEN SERVICE TOPOLOGY (SHATCAR-based)
-# ============================================================================
+# -----------------------------------------------------------------------------
+# TRANSFORMER-DRIVEN TOPOLOGY
+# -----------------------------------------------------------------------------
 def build_transformer_topology(
     events: List[LogEvent],
     model: SHATCAR,
     vocab: Dict[str, int],
     nlp,
-    device: torch.device
+    device: torch.device,
 ) -> nx.DiGraph:
-    """
-    FIXED: Transformer-driven topology that ALWAYS renders cleanly.
-
-    Improvements:
-    - Ensures nodes always added first
-    - Avoids collapsing graph when embeddings are uniform
-    - Normalizes similarities into readable 0–1 range
-    - Requires minimum activity for edges
-    - Handles NaNs or infs gracefully
-    - Guarantees directional edges but prevents over-connection
-    """
-
     G = nx.DiGraph()
     if not events:
         return G
 
-    # Group by service
-    svc_map = build_service_mapping(events)
+    svc_map_global = build_service_mapping(events)
     svc_groups: Dict[str, List[LogEvent]] = defaultdict(list)
     for e in events:
-        svc = e.service or "UNK"
-        svc_groups[svc].append(e)
-
-    # Add all service nodes FIRST to avoid collapsing
-    for svc in svc_groups.keys():
-        G.add_node(svc)
+        s = e.service or "UNK"
+        svc_groups[s].append(e)
 
     model.eval()
     svc_emb = {}
-    svc_car = {}
 
-    # Compute embeddings per service
     for svc, svc_events in svc_groups.items():
-        # Take last 30 logs to represent service
         subset = svc_events[-30:] if len(svc_events) > 30 else svc_events
-
         if not subset:
             continue
 
-        # Prepare model inputs
         X_ids, X_masks, sems, lvl_ids, svc_ids, time_feats = [], [], [], [], [], []
         for e in subset:
             tmpl = message_template(e.message)
@@ -1148,91 +1085,51 @@ def build_transformer_topology(
             X_masks.append(mask)
             sems.append(semantic_vector(e.message, nlp))
             lvl_ids.append(level_to_id(e.level))
-            svc_ids.append(service_to_id(e.service, svc_map))
+            svc_ids.append(service_to_id(e.service, svc_map_global))
             time_feats.append(time_features(e.timestamp))
 
-        # Convert to tensors
-        X_ids = torch.tensor(X_ids, dtype=torch.long).to(device)
-        X_masks = torch.tensor(X_masks, dtype=torch.long).to(device)
-        sems = torch.tensor(sems, dtype=torch.float32).to(device)
-        lvl_ids = torch.tensor(lvl_ids, dtype=torch.long).to(device)
-        svc_ids = torch.tensor(svc_ids, dtype=torch.long).to(device)
-        time_feats = torch.tensor(time_feats, dtype=torch.float32).to(device)
+        X_ids_t = torch.tensor(X_ids, dtype=torch.long).to(device)
+        X_masks_t = torch.tensor(X_masks, dtype=torch.long).to(device)
+        sems_t = torch.tensor(sems, dtype=torch.float32).to(device)
+        lvl_ids_t = torch.tensor(lvl_ids, dtype=torch.long).to(device)
+        svc_ids_t = torch.tensor(svc_ids, dtype=torch.long).to(device)
+        time_feats_t = torch.tensor(time_feats, dtype=torch.float32).to(device)
 
         with torch.no_grad():
-            # get pooled embeddings
-            logits = model(X_ids, X_masks, sems, lvl_ids, svc_ids, time_feats)
-            pooled = logits  # (B,2)
-
-        # Mean embed per service
-        svc_emb[svc] = pooled.mean(dim=0).float().cpu()
-
-        # Get CAR weights too
-        with torch.no_grad():
-            context = (
-                model.semantic_proj(sems)
-                + model.level_embed(lvl_ids)
-                + model.service_embed(svc_ids)
-                + model.time_proj(time_feats)
-            )
-            car = model.router(context).mean(dim=0).float().cpu()
-        svc_car[svc] = car
+            pooled = model.pooled_embedding(X_ids_t, X_masks_t, sems_t, lvl_ids_t, svc_ids_t, time_feats_t)
+            svc_emb[svc] = pooled.mean(dim=0).cpu()
 
     services = list(svc_emb.keys())
+    for svc in services:
+        G.add_node(svc)
 
-    # Compute edges between services
     for i in range(len(services)):
         for j in range(len(services)):
             if i == j:
                 continue
-
-            s1 = services[i]
-            s2 = services[j]
-
-            e1, e2 = svc_emb[s1], svc_emb[s2]
-            c1, c2 = svc_car[s1], svc_car[s2]
-
-            # Cosine similarities
-            sim_emb = F.cosine_similarity(e1, e2, dim=0).item()
-            sim_car = F.cosine_similarity(c1, c2, dim=0).item()
-
-            # Clamp to readable range
-            sim_emb = max(-1, min(sim_emb, 1))
-            sim_car = max(-1, min(sim_car, 1))
-
-            # Normalize into 0–1 graph weights
-            w = (sim_emb + 1) / 2 * 0.6 + (sim_car + 1) / 2 * 0.4
-
-            # Avoid NaNs
-            if w != w:
-                continue
-
-            # Threshold: only show meaningful edges
-            if w > 0.35:  # tuned threshold for readability
-                G.add_edge(s1, s2, weight=float(round(w, 3)))
+            s1, s2 = services[i], services[j]
+            v1, v2 = svc_emb[s1], svc_emb[s2]
+            sim = F.cosine_similarity(v1, v2, dim=0).item()
+            sim = max(-1.0, min(1.0, sim))
+            w = (sim + 1.0) / 2.0  # 0..1
+            if w > 0.35:
+                G.add_edge(s1, s2, weight=round(w, 3))
 
     return G
 
 
-# ============================================================================
-#        SECURE TRANSFORMER-BASED SUMMARY (SHATCAR + spaCy)
-# ============================================================================
+# -----------------------------------------------------------------------------
+# SECURE HYBRID SUMMARY (spaCy + TRANSFORMER)
+# -----------------------------------------------------------------------------
 def secure_transformer_summary(
     events: List[LogEvent],
     model: SHATCAR,
     vocab: Dict[str, int],
     nlp,
-    device: torch.device
+    device: torch.device,
 ) -> str:
-    """
-    Secure, transformer-driven summarizer:
-      - uses SHATCAR latent embeddings of last ~300 logs
-      - analyzes similarity structure in embedding space
-      - uses spaCy nouns/verbs to extract key terms
-      - composes a layman, privacy-preserving explanation
-    """
     if not events:
-        return "No log activity detected."
+        return "No logs found."
 
     subset = events[-300:] if len(events) > 300 else events
     svc_map = build_service_mapping(subset)
@@ -1257,148 +1154,221 @@ def secure_transformer_summary(
 
     model.eval()
     with torch.no_grad():
-        h = model.struct_embed(X_ids_t)
-        h = model.pos(h)
-        context = (
-            model.semantic_proj(sems_t)
-            + model.level_embed(lvl_ids_t)
-            + model.service_embed(svc_ids_t)
-            + model.time_proj(time_feats_t)
-        )
-        fused = h + context.unsqueeze(1)
+        embs = model.pooled_embedding(X_ids_t, X_masks_t, sems_t, lvl_ids_t, svc_ids_t, time_feats_t)
 
-        level_outputs = []
-        src_key_padding_mask = (X_masks_t == 0)
-        for layer in model.levels:
-            lvl_h = layer(fused, src_key_padding_mask=src_key_padding_mask)
-            level_outputs.append(lvl_h)
-
-        mask_f = X_masks_t.unsqueeze(-1).float()
-        pooled_per_level = []
-        for lvl_h in level_outputs:
-            summed = (lvl_h * mask_f).sum(dim=1)
-            denom = mask_f.sum(dim=1).clamp(min=1.0)
-            pooled_per_level.append(summed / denom)
-
-        embs = sum(pooled_per_level) / len(pooled_per_level)  # (B, D)
-
-    # Analyze variety in embedding space
     B = embs.size(0)
     if B > 1:
         norm_embs = embs / (embs.norm(dim=1, keepdim=True) + 1e-6)
         sim_mat = torch.matmul(norm_embs, norm_embs.T)
-        upper = sim_mat[torch.triu(torch.ones_like(sim_mat), diagonal=1) == 1]
-        avg_sim = upper.mean().item() if upper.numel() > 0 else 1.0
+        avg_sim = (sim_mat.sum() - torch.diag(sim_mat).sum()) / (B * (B - 1))
+        avg_sim = avg_sim.item()
     else:
         avg_sim = 1.0
 
-    if avg_sim > 0.75:
-        variety_text = "Logs are highly similar, suggesting one main scenario or flow."
-    elif avg_sim > 0.45:
-        variety_text = "Logs show related scenarios with some variation in behavior."
+    if avg_sim > 0.8:
+        complexity_text = "Logs describe one unified behavior pattern."
+    elif avg_sim > 0.5:
+        complexity_text = "Logs show related flows with moderate variation."
     else:
-        variety_text = "Logs seem to cover several distinct behavior patterns."
+        complexity_text = "Multiple distinct behaviors are present."
 
-    services = Counter(e.service or "UNK" for e in subset)
+    full_text = "\n".join(e.message for e in subset)
+    doc = nlp(full_text)
+
+    nouns = Counter()
+    verbs = Counter()
+    svos = Counter()
+
+    for sent in doc.sents:
+        info = advanced_spacy_parse(sent.text, nlp)
+        for n in info["nouns"]:
+            nouns[n] += 1
+        for v in info["verbs"]:
+            verbs[v] += 1
+        for triple in info["svos"]:
+            svos[triple] += 1
+
+    top_nouns = ", ".join(w for w, _ in nouns.most_common(5)) or "None"
+    top_verbs = ", ".join(w for w, _ in verbs.most_common(5)) or "None"
+    top_svos = "; ".join(f"{s}->{v}->{o}" for (s, v, o), _ in svos.most_common(3)) or "None"
+
+    svc_counts = Counter(e.service or "UNK" for e in subset)
+    svc_text = ", ".join(f"{s}({c})" for s, c in svc_counts.most_common(3)) or "None"
+
     errors = [e for e in subset if e.level in ("ERROR", "CRITICAL", "FATAL")]
-    top_services = services.most_common(3)
-    svc_summary = (
-        ", ".join(f"`{s}` ({c} logs)" for s, c in top_services)
-        if top_services else "No identifiable services"
-    )
-
-    error_rate = len(errors) / len(subset)
-    if len(errors) == 0:
-        error_story = "No significant errors were observed in this slice of logs."
-    elif error_rate < 0.05:
-        error_story = f"A few errors occurred ({len(errors)}), but they are relatively infrequent."
-    elif error_rate < 0.2:
-        error_story = f"Errors are noticeable ({len(errors)} events) and may indicate emerging issues."
+    err_rate = len(errors) / len(subset)
+    if err_rate == 0:
+        err_text = "Errors are absent in this slice."
+    elif err_rate < 0.1:
+        err_text = "Issues exist but are minor."
+    elif err_rate < 0.3:
+        err_text = "System shows emerging instabilities."
     else:
-        error_story = f"Errors are quite frequent ({len(errors)} events), suggesting instability or failures."
+        err_text = "System might be experiencing widespread failures."
 
-    def top_terms(logs: List[LogEvent], n: int = 6):
-        if not logs:
-            return []
-        text = "\n".join(e.message for e in logs)
-        doc = nlp(text)
-        counts = Counter()
-        for tok in doc:
-            if tok.is_stop or tok.is_punct or tok.is_space:
-                continue
-            if tok.pos_ not in ("NOUN", "VERB"):
-                continue
-            lemma = tok.lemma_.lower()
-            counts[lemma] += 1
-        return [w for w, _ in counts.most_common(n)]
+    return f"""
+Transformer + spaCy Summary
+============================
 
-    error_terms = top_terms(errors, 6)
-    normal_terms = top_terms([e for e in subset if e not in errors], 6)
+Behavior Complexity:
+{complexity_text}
 
-    error_terms_text = ", ".join(error_terms) if error_terms else "no dominant error keywords"
-    normal_terms_text = ", ".join(normal_terms) if normal_terms else "no dominant normal-operation keywords"
+Service Activity:
+{svc_text}
 
-    timestamps = [normalize_ts(e.timestamp) for e in subset if e.timestamp]
+Error Condition:
+{err_text}
+
+Dominant Topics (nouns):
+{top_nouns}
+
+Key Operations (verbs):
+{top_verbs}
+
+Role-Action-Object Patterns (SVO):
+{top_svos}
+
+This summary fuses:
+- SHATCAR transformer latent behavior embeddings
+- Deep spaCy linguistic parsing (nouns, verbs, SVO)
+- No external LLMs, fully local and secure.
+""".strip()
+
+
+# -----------------------------------------------------------------------------
+# HEURISTIC FALLBACK SUMMARY
+# -----------------------------------------------------------------------------
+def build_summary(events: List[LogEvent], nlp) -> str:
+    if not events:
+        return "No logs found."
+
+    services = Counter(e.service or "UNK" for e in events)
+    errors = [e for e in events if e.level in ("ERROR", "CRITICAL", "FATAL")]
+    templates = Counter(message_template(e.message) for e in events)
+
+    timestamps = [normalize_ts(e.timestamp) for e in events if e.timestamp]
     if timestamps:
         span = (timestamps[-1] - timestamps[0]).total_seconds()
         if span < 60:
-            timeline_text = "Activity is concentrated within a very short time window."
+            tl = "Logs occurred in a short burst."
         elif span < 300:
-            timeline_text = "Activity progresses over a few minutes, showing a short-lived scenario."
+            tl = "Logs span a few minutes."
         else:
-            timeline_text = "Activity spans a longer period, indicating ongoing system behavior."
+            tl = "Logs span a long-running window."
     else:
-        timeline_text = "Timing information is limited or missing."
+        tl = "Timestamps missing or inconsistent."
+
+    if not errors:
+        err_text = "No errors detected."
+    else:
+        err_services = Counter(e.service or "UNK" for e in errors)
+        main_svc = err_services.most_common(1)[0][0]
+        err_text = f"{len(errors)} errors detected, mainly in `{main_svc}`."
+
+    top_services = services.most_common(3)
+    top_templates = templates.most_common(5)
+
+    template_lines = []
+    for t, c in top_templates:
+        friendly = (
+            t.replace("<NUM>", "numbers")
+            .replace("<UUID>", "UUIDs")
+            .replace("<HEX>", "hex values")
+            .replace("<IP>", "IP addresses")
+        )
+        template_lines.append(f"- {friendly} (~{c})")
 
     summary = f"""
-Transformer-Based Secure Summary
---------------------------------
-The SHATCAR transformer encoded {len(subset)} recent log entries into a latent behavior space.
+Heuristic Summary (fallback)
+----------------------------
+Log span: {tl}
 
-Overall Variety:
-{variety_text}
+Top services:
+{", ".join(f"{svc} ({cnt})" for svc, cnt in top_services)}
 
-Timeline:
-{timeline_text}
+Errors:
+{err_text}
 
-Service Activity:
-The most active services in this window are: {svc_summary}.
-
-Error Behavior:
-{error_story}
-Error-related messages commonly involve: {error_terms_text}.
-Normal-operation logs often mention: {normal_terms_text}.
-
-Interpretation:
-This summary is based on transformer embeddings plus spaCy's vocabulary signals.
-It describes, in human terms, how focused or diverse recent activity is, which services
-are most involved, and whether the system appears stable or trending towards failure.
-    """.strip()
-
+Common log patterns:
+{chr(10).join(template_lines) if template_lines else "None"}
+""".strip()
     return summary
-##############################################
-# app.py — PART 3/3
-# Streamlit UI
-##############################################
 
+
+# -----------------------------------------------------------------------------
+# SAFE EMBEDDING FOR CHAT (no tensor size mismatch)
+# -----------------------------------------------------------------------------
+def safe_embed_message(
+    model: SHATCAR,
+    vocab: Dict[str, int],
+    nlp,
+    device: torch.device,
+    msg: str,
+    level: Optional[str] = "INFO",
+    service: Optional[str] = "CHAT",
+    svc_map: Optional[Dict[str, int]] = None,
+    ts: Optional[datetime] = None,
+) -> torch.Tensor:
+    """
+    Produce a pooled embedding for any message (log or query) with safe shapes.
+    Shapes:
+      - X_ids: (1, STRUCT_MAX_LEN)
+      - mask:  (1, STRUCT_MAX_LEN)
+      - sems:  (1, SEM_DIM)
+      - lvl:   (1,)
+      - svc:   (1,)
+      - time:  (1,4)
+    """
+    tmpl = message_template(msg)
+    ids, mask = template_to_ids(tmpl, vocab)
+
+    X_ids = torch.tensor([ids], dtype=torch.long).to(device)
+    X_masks = torch.tensor([mask], dtype=torch.long).to(device)
+
+    sem = semantic_vector(msg, nlp)
+    sem = sem[:SEM_DIM] if len(sem) >= SEM_DIM else sem + [0.0] * (SEM_DIM - len(sem))
+    sems = torch.tensor([sem], dtype=torch.float32).to(device)
+
+    lvl_ids = torch.tensor([level_to_id(level)], dtype=torch.long).to(device)
+
+    if svc_map is None:
+        svc_ids = torch.tensor([0], dtype=torch.long).to(device)
+    else:
+        sid = service_to_id(service, svc_map)
+        svc_ids = torch.tensor([sid], dtype=torch.long).to(device)
+
+    tf = time_features(ts)
+    time_feats = torch.tensor([tf], dtype=torch.float32).to(device)
+
+    with torch.no_grad():
+        emb = model.pooled_embedding(X_ids, X_masks, sems, lvl_ids, svc_ids, time_feats)  # (1,D)
+
+    emb = emb[0]
+    emb = emb / (emb.norm() + 1e-6)
+    return emb
+
+
+# -----------------------------------------------------------------------------
+# STREAMLIT APP
+# -----------------------------------------------------------------------------
 st.set_page_config(page_title="SHATCAR Log Analyzer", layout="wide")
-st.title("🔍 SHATCAR Log Analyzer (Strong-Attention SHATCAR)")
+st.title("🔍 SHATCAR Log Analyzer (spaCy + Transformer + Chat)")
 st.caption(
     "Upload any log file (text or JSON lines) → adaptive parsing → temporal analytics → "
-    "secure transformer-based summarization → RCA → transformer-driven topology → structural patterns → SHATCAR training & scoring."
+    "secure transformer+spaCy summarization → RCA → transformer-driven topology → structural patterns → SHATCAR training → chat with the model."
 )
 
 # Init DB
 init_db()
 
-# Load spaCy (cached)
+# Load spaCy
 @st.cache_resource
 def load_spacy_model():
-    return spacy.load(SPACY_MODEL, disable=["parser", "textcat"])
+    return spacy.load(SPACY_MODEL, disable=["textcat"])
+
 
 nlp = load_spacy_model()
 
-# Global device
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 # Sidebar input
@@ -1421,7 +1391,6 @@ if st.sidebar.button("Clear stored logs"):
     st.sidebar.warning("Log store cleared. Upload again to continue.")
     st.stop()
 
-# Load stored logs
 raw_logs = load_logs_from_db()
 if not raw_logs:
     st.info("No logs stored yet. Upload a .log or .txt file to begin.")
@@ -1429,10 +1398,8 @@ if not raw_logs:
 
 st.sidebar.write(f"📦 Total stored log lines: **{len(raw_logs)}**")
 
-# Parse logs
 events = parse_logs(raw_logs)
 
-# High-level stats
 levels = Counter(e.level or "UNKNOWN" for e in events)
 services = Counter(e.service or "UNK" for e in events)
 errors = sum(1 for e in events if e.level in ("ERROR", "CRITICAL", "FATAL"))
@@ -1448,8 +1415,7 @@ with c3:
 st.write("### Level distribution")
 st.bar_chart({k: v for k, v in levels.items()})
 
-# Tabs
-tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs(
+tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8 = st.tabs(
     [
         "⏱ Temporal Analytics",
         "📝 Secure Transformer Summary",
@@ -1458,6 +1424,7 @@ tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs(
         "🧩 Structural Patterns",
         "📜 Raw Logs",
         "🧬 SHATCAR Transformer",
+        "🗨️ Converse With Model",
     ]
 )
 
@@ -1466,13 +1433,10 @@ with tab1:
     plot_temporal_analytics(events)
 
 with tab2:
-    st.subheader("Secure Transformer-Based Summary (SHATCAR-driven)")
+    st.subheader("Secure Transformer-Based Summary (spaCy + SHATCAR)")
     vocab = load_shatcar_vocab()
     if vocab is None or not os.path.exists(SHATCAR_MODEL_PATH):
-        st.warning(
-            "The SHATCAR transformer is not trained yet. "
-            "Using heuristic layman summary instead."
-        )
+        st.warning("SHATCAR transformer is not trained yet. Showing heuristic layman summary instead.")
         summary_text = build_summary(events, nlp)
     else:
         model = load_shatcar_model(vocab_size=len(vocab), device=device)
@@ -1482,7 +1446,6 @@ with tab2:
 with tab3:
     st.subheader("Heuristic Root Cause Analysis")
     rca = root_cause_analysis(events)
-
     if not rca["per_trace"]:
         st.info("No ERROR/CRITICAL/FATAL logs found for RCA.")
     else:
@@ -1495,8 +1458,7 @@ with tab3:
         with st.expander("Per-trace root cause details"):
             for item in rca["per_trace"]:
                 st.markdown(
-                    f"- Trace: `{item['trace_id']}` | Service: `{item['service']}` | "
-                    f"Time: `{item['time']}`\n\n"
+                    f"- Trace: `{item['trace_id']}` | Service: `{item['service']}` | Time: `{item['time']}`\n\n"
                     f"  → {item['message']}"
                 )
 
@@ -1515,7 +1477,7 @@ with tab4:
         topo_graph = build_transformer_topology(events, model, vocab, nlp, device)
         if len(topo_graph.nodes()) == 0:
             st.info(
-                "SHATCAR topology could not infer any strong relationships. "
+                "SHATCAR topology could not infer strong relationships. "
                 "Showing baseline trace-based topology instead."
             )
             baseline_graph = build_topology_baseline(events)
@@ -1536,7 +1498,7 @@ with tab6:
     st.text("\n".join(raw_logs))
 
 with tab7:
-    st.subheader("Unified SHATCAR Transformer (Strong-Attention)")
+    st.subheader("Unified SHATCAR Transformer (Strong Attention)")
     st.write(f"Using device: `{device}`")
 
     epochs = st.slider("Training epochs", 1, 10, 3)
@@ -1554,3 +1516,146 @@ with tab7:
     st.write("**Score Recent Logs (SHATCAR structural error probability)**")
     if st.button("Run SHATCAR inference on latest logs"):
         run_shatcar_inference(events, nlp, device=device)
+
+with tab8:
+    st.subheader("🗨️ Converse With The Model (spaCy + SHATCAR)")
+    st.caption("Ask questions about logs, anomalies, services, RCA, or summaries. Fully local, no LLM.")
+
+    vocab = load_shatcar_vocab()
+    model_exists = vocab is not None and os.path.exists(SHATCAR_MODEL_PATH)
+
+    user_query = st.text_area(
+        "Ask anything about the logs:",
+        placeholder=(
+            "examples:\n"
+            "- What caused the errors?\n"
+            "- Which service is unstable?\n"
+            "- Summarize actions of auth service\n"
+            "- Show anomalies between 10-11 pm\n"
+            "- What patterns does the transformer detect?"
+        ),
+        height=140,
+    )
+
+    if st.button("Ask"):
+        if not user_query.strip():
+            st.warning("Please enter a query.")
+            st.stop()
+
+        qdoc = nlp(user_query)
+        q_nouns = [t.lemma_.lower() for t in qdoc if t.pos_ == "NOUN" and not t.is_stop]
+        q_verbs = [t.lemma_.lower() for t in qdoc if t.pos_ == "VERB" and not t.is_stop]
+
+        st.markdown("#### 🔍 Query Linguistic Breakdown")
+        st.write(f"**Nouns:** {q_nouns}")
+        st.write(f"**Verbs:** {q_verbs}")
+        st.write("---")
+
+        svc_map = build_service_mapping(events)
+
+        if model_exists:
+            st.markdown("#### 🤖 Transformer Semantic Search")
+            model = load_shatcar_model(vocab_size=len(vocab), device=device)
+            model.eval()
+
+            query_emb = safe_embed_message(
+                model,
+                vocab,
+                nlp,
+                device,
+                user_query,
+                level="INFO",
+                service="CHAT_QUERY",
+                svc_map=svc_map,
+                ts=None,
+            )
+
+            match_rows = []
+            with torch.no_grad():
+                for e in events:
+                    log_emb = safe_embed_message(
+                        model,
+                        vocab,
+                        nlp,
+                        device,
+                        e.message,
+                        level=e.level or "INFO",
+                        service=e.service or "UNK",
+                        svc_map=svc_map,
+                        ts=e.timestamp,
+                    )
+                    sim = float(torch.dot(query_emb, log_emb))
+                    match_rows.append((sim, e))
+
+            match_rows.sort(key=lambda x: x[0], reverse=True)
+            top_matches = match_rows[:5]
+
+            table_data = [
+                {
+                    "Similarity": round(sim, 3),
+                    "Service": e.service or "UNK",
+                    "Level": e.level or "UNK",
+                    "Message": e.message[:120],
+                }
+                for sim, e in top_matches
+            ]
+            st.table(table_data)
+            st.markdown("---")
+        else:
+            st.info("Transformer not trained yet → using heuristic query handler only.")
+
+        st.markdown("#### 🧠 Deterministic Reasoning (No LLM)")
+        q = user_query.lower()
+        if "cause" in q or "why" in q or "root" in q:
+            intent = "root_cause"
+        elif "summar" in q:
+            intent = "summary"
+        elif "error" in q or "fail" in q:
+            intent = "error_analysis"
+        elif "service" in q:
+            intent = "service_info"
+        elif "pattern" in q or "structure" in q:
+            intent = "patterns"
+        else:
+            intent = "general"
+
+        if intent == "root_cause":
+            rca = root_cause_analysis(events)
+            if not rca["top_messages"]:
+                st.write("No errors detected. System appears healthy.")
+            else:
+                svc = rca["top_services"][0][0]
+                msg = rca["top_messages"][0][0]
+                st.write(f"**Likely cause:** Service `{svc}` with message: “{msg}”")
+
+        elif intent == "summary":
+            if model_exists:
+                model = load_shatcar_model(len(vocab), device=device)
+                out = secure_transformer_summary(events, model, vocab, nlp, device)
+            else:
+                out = build_summary(events, nlp)
+            st.text(out)
+
+        elif intent == "error_analysis":
+            errs = [e for e in events if e.level in ("ERROR", "CRITICAL", "FATAL")]
+            if not errs:
+                st.write("No critical errors found.")
+            else:
+                svc_counts = Counter(e.service or "UNK" for e in errs)
+                st.write("**Error-heavy services:**")
+                for s, c in svc_counts.most_common():
+                    st.write(f"- `{s}`: {c} errors")
+
+        elif intent == "service_info":
+            svc_counts = Counter(e.service or "UNK" for e in events)
+            st.write("**Service activity:**")
+            for s, c in svc_counts.most_common(5):
+                st.write(f"- `{s}`: {c} logs")
+
+        elif intent == "patterns":
+            rows = extract_structural_patterns(events)
+            st.table(rows)
+
+        else:
+            st.write("I analyzed your query using semantics and role patterns.")
+            st.write("Try asking about *root cause*, *errors*, *patterns*, *summaries*, or *service activity*.")
