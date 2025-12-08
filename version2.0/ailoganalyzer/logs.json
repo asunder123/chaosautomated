@@ -1,0 +1,43 @@
+
+[
+  {
+    "timestamp": "2025-12-08T10:15:32Z",
+    "level": "INFO",
+    "message": "Service STARTUP completed successfully on node <IP>."
+  },
+  {
+    "timestamp": "2025-12-08T10:16:05Z",
+    "level": "WARN",
+    "message": "Connection retry attempt #1 for database cluster."
+  },
+  {
+    "timestamp": "2025-12-08T10:16:45Z",
+    "level": "ERROR",
+    "message": "AUTH_FAILURE: Invalid credentials for user admin."
+  },
+  {
+    "timestamp": "2025-12-08T10:17:10Z",
+    "level": "ERROR",
+    "message": "Timeout occurred while processing request ID 12345."
+  },
+  {
+    "timestamp": "2025-12-08T10:18:00Z",
+    "level": "INFO",
+    "message": "Data processing started for batch job JOB-567."
+  },
+  {
+    "timestamp": "2025-12-08T10:18:45Z",
+    "level": "ERROR",
+    "message": "CRASH_LOOP detected in container payment-service."
+  },
+  {
+    "timestamp": "2025-12-08T10:19:20Z",
+    "level": "WARN",
+    "message": "HTTP 503 Service Unavailable during API call to /checkout."
+  },
+  {
+    "timestamp": "2025-12-08T10:20:00Z",
+    "level": "INFO",
+    "message": "Shutdown initiated for node <IP>."
+  }
+]
