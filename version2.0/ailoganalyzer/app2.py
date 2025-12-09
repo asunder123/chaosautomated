@@ -33,7 +33,7 @@ except ImportError:
 # CONFIG
 # -----------------------------------------------------------------------------
 DB_PATH = "logs.db"
-SPACY_MODEL = "en_core_web_sm"
+SPACY_MODEL = "en_core_web_lg"
 
 SHATCAR_MODEL_PATH = "shatcar_model.pt"
 SHATCAR_VOCAB_PATH = "shatcar_vocab.json"
